@@ -51,7 +51,7 @@ Expected:
 
 ## 3) Remote Runtime Smoke Test (Tailscale TCP)
 
-On GPU server node:
+On server node:
 
 1. Find Tailnet IP:
 

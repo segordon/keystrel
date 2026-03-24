@@ -1,10 +1,10 @@
 # Keystrel Project Agent Guide
 
-This file documents what has been built so far for the Ubuntu GPU speech-to-text workflow and how future agents should work on it safely.
+This file documents what has been built so far for the Ubuntu speech-to-text workflow and how future agents should work on it safely.
 
 ## Project Goal
 
-Provide fast, local, GPU-accelerated speech-to-text (STT) for terminal workflows (including interactive prompt tools), with practical push-to-talk behavior and no dependency on piping stdin into the app.
+Provide fast, local speech-to-text (STT) for terminal workflows (including interactive prompt tools), with practical push-to-talk behavior and no dependency on piping stdin into the app.
 
 ## Naming Status
 
@@ -23,28 +23,26 @@ Provide fast, local, GPU-accelerated speech-to-text (STT) for terminal workflows
 ## Current Environment
 
 - OS/session: Ubuntu derivative, X11 session.
-- GPU: NVIDIA RTX 5070 Ti with working NVIDIA driver/CUDA runtime.
+- Runtime target: any host where `faster-whisper` runs.
 - Python: 3.12.
-- Transcription backend: `faster-whisper` with CUDA via `ctranslate2`.
+- Transcription backend: `faster-whisper` via `ctranslate2`.
 
 ## What Was Implemented
 
-### 1) GPU backend install and validation
+### 1) faster-whisper backend install and validation
 
 - Created venv at `$HOME/.venvs/faster-whisper`.
 - Installed core Python packages:
   - `faster-whisper`
-  - `nvidia-cublas-cu12`
-  - `nvidia-cudnn-cu12`
   - `sounddevice`
   - `soundfile`
+  - host-specific accelerator/runtime dependencies as needed
 - Added env helper: `$HOME/.venvs/faster-whisper/env.sh`
   - exports `VIRTUAL_ENV`
   - prepends `PATH`
-  - sets `LD_LIBRARY_PATH` for cuBLAS/cuDNN wheel libs
+  - supports runtime library path overrides when needed
 - Verified:
-  - CUDA visible through `ctranslate2`
-  - model load on GPU succeeds
+  - model load/transcription path succeeds
 
 ### 2) Warm daemon architecture
 
@@ -204,11 +202,11 @@ Relevant client options/env:
 - `--chime-volume` (`KEYSTREL_CHIME_VOLUME`)
 - `--chime-cooldown-ms` (`KEYSTREL_CHIME_COOLDOWN_MS`)
 
-### 11) Centralized GPU inference over Tailscale
+### 11) Centralized inference over Tailscale
 
 The same daemon process now supports optional TCP transport for Tailnet clients.
 
-Server-side env (GPU node):
+Server-side env (daemon host):
 
 - `KEYSTREL_TCP_LISTEN=<tailscale-ip>`
 - `KEYSTREL_TCP_PORT=8765`
@@ -387,7 +385,7 @@ pactl list short sinks
 ## Current Status Snapshot
 
 - Keystrel daemon: running under user systemd.
-- Backend: GPU (`cuda`) and English-tuned model settings.
+- Backend: `faster-whisper` runtime configured for host-supported device settings.
 - PTT: active through a global shortcut (example: Ctrl+`).
 - Mute-while-listening: implemented and restored safely.
 - Concurrency protections: enabled in both client and PTT script.

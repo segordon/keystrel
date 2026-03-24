@@ -1,8 +1,15 @@
 # Keystrel Quickstart and Operating Guide
 
-![Keystrel mascot](docs/keystrel_logo.png)
+<p align="center">
+  <img src="docs/keystrel_logo.png" alt="Keystrel mascot logo" width="220" />
+</p>
 
-This project provides local, GPU-accelerated speech-to-text for Linux X11 workflows, with push-to-talk behavior that can type into any focused X11 text field (terminal, browser, editor, chat apps, and more).
+<p align="center">
+  <strong>Keystrel</strong><br />
+  Local speech-to-text with push-to-talk typing for Linux X11 workflows.
+</p>
+
+This project provides local speech-to-text for Linux X11 workflows, with push-to-talk behavior that can type into any focused X11 text field (terminal, browser, editor, chat apps, and more).
 
 For deep implementation history and agent handoff context, read `docs/AGENTS.md`.
 For command-only reference, use `docs/CHEATSHEET.md`.
@@ -11,7 +18,7 @@ For rename details and upgrade steps, use `docs/MIGRATION.md`.
 
 ## What You Get
 
-- Persistent `faster-whisper` backend on NVIDIA GPU for low latency after warm-up.
+- Persistent `faster-whisper` backend for low latency after warm-up.
 - Microphone capture client with auto-stop on trailing silence.
 - Audible start chime before each listen cycle so nearby people can tell dictation is active.
 - Optional mute of all audio output during listening to reduce feedback contamination.
@@ -36,7 +43,7 @@ For rename details and upgrade steps, use `docs/MIGRATION.md`.
 There are 3 layers:
 
 1. `keystrel-daemon` (always-on backend)
-   - Loads Whisper model once and keeps it warm in VRAM.
+   - Loads Whisper model once and keeps it warm in memory.
    - Accepts requests over Unix socket and optional TCP (for Tailnet clients).
    - Returns transcript JSON.
 
@@ -63,7 +70,7 @@ flowchart LR
     C2 --> D{Transport mode}
 
     D -->|Local default| L1[Unix socket\n~/.cache/keystrel/faster-whisper.sock]
-    L1 --> S[keystrel-daemon\nGPU faster-whisper model]
+    L1 --> S[keystrel-daemon\nfaster-whisper model service]
 
     D -->|Remote Tailnet| R1[TCP + auth token\ntcp://<tailscale-ip>:8765]
     R1 --> S
@@ -102,12 +109,12 @@ Python packages in Keystrel venv include:
 - `sounddevice`
 - `soundfile`
 - `webrtcvad-wheels`
-- `nvidia-cublas-cu12`
-- `nvidia-cudnn-cu12`
+
+Install any additional accelerator/runtime packages required by your host platform.
 
 ## Automated Testing
 
-Run unit tests (no microphone/GPU required):
+Run unit tests (no microphone or model runtime required):
 
 ```bash
 python -m unittest discover -s tests -v
@@ -143,12 +150,12 @@ View logs live:
 journalctl --user -u keystrel-daemon -f
 ```
 
-## Centralized GPU over Tailscale
+## Centralized Inference over Tailscale
 
-You can run one GPU daemon for your Tailnet and use lightweight clients from other machines.
+You can run one daemon host for your Tailnet and use lightweight clients from other machines.
 No separate server app is required; the same `keystrel-daemon` process can expose both transports.
 
-### Server node (GPU host)
+### Server node (daemon host)
 
 Set in `$HOME/.config/keystrel-daemon.env`:
 
@@ -161,7 +168,7 @@ KEYSTREL_MAX_REQUEST_BYTES=10485760
 KEYSTREL_MAX_AUDIO_BYTES=6291456
 ```
 
-Use `tailscale ip -4` on the GPU node to get `<tailscale-ip>`.
+Use `tailscale ip -4` on the server node to get `<tailscale-ip>`.
 
 Then restart daemon:
 
@@ -184,7 +191,7 @@ You can also start from the provided template:
 cp keystrel-client.env.example .env
 ```
 
-`keystrel-client` and `keystrel-ptt` then keep local capture/chime/typing, while transcription runs on the remote GPU daemon.
+`keystrel-client` and `keystrel-ptt` then keep local capture/chime/typing, while transcription runs on the remote daemon.
 
 ## Quickstart (Daily Usage)
 
@@ -312,7 +319,7 @@ Two lock layers prevent race conditions and repeated delayed output:
 
 Edit `$HOME/.config/keystrel-daemon.env`.
 
-Current defaults:
+Current defaults (override device/compute on non-CUDA hosts):
 
 ```dotenv
 KEYSTREL_MODEL=large-v3

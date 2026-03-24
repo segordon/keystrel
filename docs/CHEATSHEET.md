@@ -1,6 +1,6 @@
 # Keystrel Cheat Sheet
 
-Fast command reference for the local GPU Keystrel stack.
+Fast command reference for the local Keystrel stack.
 
 Migration note: use `keystrel-*` commands and `KEYSTREL_*` env vars.
 Legacy `STT_*` env vars are still accepted for compatibility and emit a one-time deprecation warning.
