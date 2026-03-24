@@ -72,6 +72,22 @@ def parse_env_bool(name, default):
         return default
 
 
+def parse_env_choice(name, default, choices):
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+
+    value = str(raw).strip().lower()
+    if value in choices:
+        return value
+
+    print(
+        f"[stt-client] invalid {name}={raw!r}, using default {default}",
+        file=sys.stderr,
+    )
+    return default
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record microphone audio and request transcription from stt-daemon"
@@ -173,6 +189,12 @@ def parse_args():
         help="mute all audio output sinks while recording",
     )
     parser.add_argument(
+        "--mute-start-delay-ms",
+        type=int,
+        default=parse_env_int("STT_MUTE_START_DELAY_MS", 0),
+        help="delay muting output sinks after capture starts",
+    )
+    parser.add_argument(
         "--webrtcvad",
         action=argparse.BooleanOptionalAction,
         default=parse_env_bool("STT_WEBRTCVAD", True),
@@ -222,6 +244,71 @@ def parse_args():
         default=parse_env_float("STT_SOCKET_TIMEOUT", 20.0),
         help="seconds before daemon socket connect/read timeout",
     )
+    parser.add_argument(
+        "--start-chime",
+        action=argparse.BooleanOptionalAction,
+        default=parse_env_bool("STT_START_CHIME", True),
+        help="play an audible chime before muting output and listening",
+    )
+    parser.add_argument(
+        "--chime-backend",
+        choices=("auto", "pipewire", "paplay", "canberra", "sounddevice"),
+        default=parse_env_choice(
+            "STT_CHIME_BACKEND",
+            "pipewire",
+            {"auto", "pipewire", "paplay", "canberra", "sounddevice"},
+        ),
+        help="chime playback backend preference",
+    )
+    parser.add_argument(
+        "--chime-file",
+        default=os.environ.get("STT_CHIME_FILE", "/usr/share/sounds/freedesktop/stereo/bell.oga"),
+        help="audio file path for paplay/canberra chime backends",
+    )
+    parser.add_argument(
+        "--chime-sink",
+        default=os.environ.get("STT_CHIME_SINK", ""),
+        help="optional paplay sink name/id (empty uses default sink)",
+    )
+    parser.add_argument(
+        "--chime-target",
+        default=os.environ.get("STT_CHIME_TARGET", ""),
+        help="optional PipeWire target node serial/name (empty uses auto)",
+    )
+    parser.add_argument(
+        "--chime-role",
+        default=os.environ.get("STT_CHIME_ROLE", "Music"),
+        help="PipeWire media role for chime stream (e.g. Music, Communication)",
+    )
+    parser.add_argument(
+        "--chime-event-id",
+        default=os.environ.get("STT_CHIME_EVENT_ID", "bell"),
+        help="desktop sound event id for canberra backend",
+    )
+    parser.add_argument(
+        "--chime-freq-hz",
+        type=float,
+        default=parse_env_float("STT_CHIME_FREQ_HZ", 2400.0),
+        help="start chime base frequency in Hz",
+    )
+    parser.add_argument(
+        "--chime-duration-ms",
+        type=int,
+        default=parse_env_int("STT_CHIME_DURATION_MS", 70),
+        help="start chime duration in milliseconds",
+    )
+    parser.add_argument(
+        "--chime-volume",
+        type=float,
+        default=parse_env_float("STT_CHIME_VOLUME", 0.55),
+        help="start chime output level (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--chime-cooldown-ms",
+        type=int,
+        default=parse_env_int("STT_CHIME_COOLDOWN_MS", 20),
+        help="wait after chime before muting/listening",
+    )
 
     args = parser.parse_args()
     args.sample_rate = max(1, args.sample_rate)
@@ -232,11 +319,21 @@ def parse_args():
     args.silence_seconds = max(0.0, args.silence_seconds)
     args.block_seconds = max(0.01, args.block_seconds)
     args.threshold = max(0.0, args.threshold)
+    args.mute_start_delay_ms = max(0, args.mute_start_delay_ms)
     args.speech_ratio = max(0.0, min(1.0, args.speech_ratio))
     args.start_speech_chunks = max(1, args.start_speech_chunks)
     args.pre_roll_seconds = max(0.0, args.pre_roll_seconds)
     args.noise_multiplier = max(1.0, args.noise_multiplier)
     args.socket_timeout = max(0.1, args.socket_timeout)
+    args.chime_freq_hz = max(100.0, min(4000.0, args.chime_freq_hz))
+    args.chime_duration_ms = max(20, args.chime_duration_ms)
+    args.chime_volume = max(0.0, min(1.0, args.chime_volume))
+    args.chime_cooldown_ms = max(0, args.chime_cooldown_ms)
+    args.chime_file = str(Path(args.chime_file).expanduser())
+    args.chime_sink = args.chime_sink.strip()
+    args.chime_target = args.chime_target.strip()
+    args.chime_role = args.chime_role.strip() or "Music"
+    args.chime_event_id = args.chime_event_id.strip() or "bell"
     return args
 
 
@@ -429,7 +526,7 @@ def speech_ratio_in_chunk(chunk, args, vad):
     return voiced_frames / total_frames
 
 
-def record_until_silence(args):
+def record_until_silence(args, on_tick=None):
     blocksize = max(1, int(args.sample_rate * args.block_seconds))
     audio_queue = queue.Queue()
     chunks = []
@@ -469,6 +566,11 @@ def record_until_silence(args):
         while True:
             now = time.monotonic()
             elapsed = now - started_at
+            if on_tick is not None:
+                try:
+                    on_tick(elapsed)
+                except Exception:  # noqa: BLE001
+                    pass
             if elapsed >= args.max_seconds:
                 break
 
@@ -525,6 +627,210 @@ def record_until_silence(args):
     return np.concatenate(chunks, axis=0)
 
 
+def _play_chime_paplay(args):
+    if not shutil.which("paplay"):
+        return False
+
+    chime_file = Path(args.chime_file)
+    if not chime_file.is_file():
+        return False
+
+    cmd = ["paplay"]
+    if args.chime_sink:
+        cmd.extend(["--device", args.chime_sink])
+    cmd.append(str(chime_file))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[stt-client] paplay chime failed: {exc}", file=sys.stderr)
+        return False
+
+    if result.returncode == 0:
+        if args.verbose:
+            sink_desc = args.chime_sink if args.chime_sink else "default-sink"
+            print(f"[stt-client] start chime played (paplay:{sink_desc})", file=sys.stderr)
+        return True
+
+    if args.verbose:
+        stderr = result.stderr.strip()
+        print(
+            f"[stt-client] paplay chime failed rc={result.returncode} {stderr}",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _play_chime_pipewire(args):
+    if not shutil.which("pw-play"):
+        return False
+
+    chime_file = Path(args.chime_file)
+    if not chime_file.is_file():
+        return False
+
+    cmd = [
+        "pw-play",
+        "--media-role",
+        args.chime_role,
+        "--volume",
+        str(args.chime_volume),
+        "--latency",
+        "20ms",
+    ]
+    if args.chime_target:
+        cmd.extend(["--target", args.chime_target])
+    cmd.append(str(chime_file))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[stt-client] pipewire chime failed: {exc}", file=sys.stderr)
+        return False
+
+    if result.returncode == 0:
+        if args.verbose:
+            target_desc = args.chime_target if args.chime_target else "auto-target"
+            print(f"[stt-client] start chime played (pipewire:{target_desc})", file=sys.stderr)
+        return True
+
+    if args.verbose:
+        stderr = result.stderr.strip()
+        print(
+            f"[stt-client] pipewire chime failed rc={result.returncode} {stderr}",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _play_chime_canberra(args):
+    if not shutil.which("canberra-gtk-play"):
+        return False
+
+    cmd = ["canberra-gtk-play", "-d", "stt start"]
+    if Path(args.chime_file).is_file():
+        cmd.extend(["-f", args.chime_file])
+    else:
+        cmd.extend(["-i", args.chime_event_id])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[stt-client] canberra chime failed: {exc}", file=sys.stderr)
+        return False
+
+    if result.returncode == 0:
+        if args.verbose:
+            print("[stt-client] start chime played (canberra)", file=sys.stderr)
+        return True
+
+    if args.verbose:
+        stderr = result.stderr.strip()
+        print(
+            f"[stt-client] canberra chime failed rc={result.returncode} {stderr}",
+            file=sys.stderr,
+        )
+    return False
+
+
+def _play_chime_sounddevice(args):
+    sample_rate = 48000
+    duration_s = args.chime_duration_ms / 1000.0
+    frame_count = max(1, int(sample_rate * duration_s))
+    t = np.arange(frame_count, dtype=np.float32) / sample_rate
+
+    start_hz = args.chime_freq_hz
+    end_hz = min(5200.0, start_hz * 1.65)
+    sweep_rate = (end_hz - start_hz) / max(duration_s, 1e-6)
+    phase = 2.0 * np.pi * (start_hz * t + 0.5 * sweep_rate * t * t)
+
+    waveform = (0.85 * np.sin(phase)) + (0.25 * np.sin(2.0 * phase))
+
+    attack_samples = min(int(sample_rate * 0.002), frame_count)
+    release_samples = min(int(sample_rate * 0.008), frame_count)
+    if attack_samples > 0:
+        attack = np.linspace(0.0, 1.0, attack_samples, dtype=np.float32)
+        waveform[:attack_samples] *= attack
+    if release_samples > 0:
+        release = np.linspace(1.0, 0.0, release_samples, dtype=np.float32)
+        waveform[-release_samples:] *= release
+
+    waveform = (waveform * args.chime_volume).astype(np.float32)
+
+    try:
+        sd.play(waveform, samplerate=sample_rate, blocking=True)
+        if args.verbose:
+            print("[stt-client] start chime played (sounddevice)", file=sys.stderr)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[stt-client] sounddevice chime failed: {exc}", file=sys.stderr)
+        return False
+    finally:
+        try:
+            sd.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def play_start_chime(args):
+    if not args.start_chime:
+        return
+
+    backend = args.chime_backend
+    if backend == "auto":
+        backend_order = ("pipewire", "paplay", "sounddevice", "canberra")
+    elif backend == "pipewire":
+        backend_order = ("pipewire", "paplay", "sounddevice", "canberra")
+    elif backend == "sounddevice":
+        backend_order = ("sounddevice", "pipewire", "paplay", "canberra")
+    elif backend == "paplay":
+        backend_order = ("paplay", "pipewire", "sounddevice", "canberra")
+    else:
+        backend_order = ("canberra", "pipewire", "paplay", "sounddevice")
+
+    played = False
+    for candidate in backend_order:
+        if candidate == "sounddevice":
+            played = _play_chime_sounddevice(args)
+        elif candidate == "pipewire":
+            played = _play_chime_pipewire(args)
+        elif candidate == "paplay":
+            played = _play_chime_paplay(args)
+        elif candidate == "canberra":
+            played = _play_chime_canberra(args)
+
+        if played:
+            break
+
+    if not played and args.verbose:
+        print("[stt-client] no chime backend succeeded", file=sys.stderr)
+
+    if args.chime_cooldown_ms > 0:
+        time.sleep(args.chime_cooldown_ms / 1000.0)
+
+
 def send_request(socket_path, payload, timeout_s):
     data = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -568,9 +874,25 @@ def main():
             sys.exit(2)
 
         sink_states = {}
-        try:
+        mute_applied = False
+
+        mute_start_delay_s = args.mute_start_delay_ms / 1000.0
+
+        def maybe_apply_mute(elapsed_s):
+            nonlocal sink_states, mute_applied
+            if mute_applied or not args.mute_output:
+                return
+            if elapsed_s < mute_start_delay_s:
+                return
             sink_states = mute_output_during_capture(args)
-            audio = record_until_silence(args)
+            mute_applied = True
+
+        try:
+            play_start_chime(args)
+            if args.mute_output and mute_start_delay_s <= 0:
+                sink_states = mute_output_during_capture(args)
+                mute_applied = True
+            audio = record_until_silence(args, on_tick=maybe_apply_mute)
         except Exception as exc:  # noqa: BLE001
             print(f"[stt-client] microphone capture failed: {exc}", file=sys.stderr)
             sys.exit(3)

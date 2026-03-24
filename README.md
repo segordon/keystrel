@@ -1,6 +1,6 @@
 # STT Quickstart and Operating Guide
 
-This project provides local, GPU-accelerated speech-to-text for Ubuntu GNOME terminal workflows, with push-to-talk behavior that works well for interactive prompts.
+This project provides local, GPU-accelerated speech-to-text for Ubuntu GNOME workflows, with push-to-talk behavior that can type into any focused X11 text field (terminal, browser, editor, chat apps, and more).
 
 For deep implementation history and agent handoff context, read `AGENTS.md`.
 For command-only reference, use `CHEATSHEET.md`.
@@ -9,9 +9,11 @@ For command-only reference, use `CHEATSHEET.md`.
 
 - Persistent `faster-whisper` backend on NVIDIA GPU for low latency after warm-up.
 - Microphone capture client with auto-stop on trailing silence.
+- Audible start chime before each listen cycle so nearby people can tell dictation is active.
 - Optional mute of all audio output during listening to reduce feedback contamination.
 - Push-to-talk helper that types transcript text directly into the focused X11 window.
 - GNOME global hotkey integration for practical day-to-day use.
+- Works beyond GNOME Terminal: browser text areas, web chat inputs, IDE/editor fields, and other focused text boxes.
 
 ## Current Runtime State
 
@@ -30,6 +32,7 @@ There are 3 layers:
 
 2. `stt-client` (capture/transcribe command)
    - Records mic audio.
+   - Plays a short start chime before muting and listening.
    - Applies speech gating to reject environmental noise.
    - Sends WAV path to daemon.
    - Prints transcript to stdout.
@@ -57,7 +60,8 @@ Development mirror:
 
 - `/home/user/Documents/stt/*`
 
-Important: mirror wrapper scripts currently execute the active runtime paths under `/home/user/.local`.
+Important: repository wrapper scripts in `bin/` are self-contained and resolve to this repo by default.
+You can still override script/venv locations with env vars when needed.
 
 ## Prerequisites and Installed Dependencies
 
@@ -120,13 +124,59 @@ stt-client --list-devices
 stt-client --verbose
 ```
 
-4. Use push-to-talk in terminal:
+4. Use push-to-talk in any focused text field:
 
-- Focus terminal input.
+- Focus a text input (terminal, browser, editor, etc.).
 - Press `Ctrl+grave` once.
+- You should hear a short start chime.
 - Speak naturally.
 - Pause briefly at sentence end.
 - Transcript should be typed into the focused window.
+
+## Where PTT Works
+
+Because `stt-ptt` uses `xdotool type`, it targets the currently focused X11 window, not just GNOME Terminal.
+
+Common targets:
+
+- Terminal prompts (GNOME Terminal, other X11 terminals)
+- Browser text fields (search boxes, chat inputs, form text areas)
+- Editor and IDE inputs
+- Desktop chat apps with standard text input fields
+
+Practical note:
+
+- Click/focus the exact field first, then trigger hotkey.
+- If a non-text UI control has focus, typing may be ignored or go to the wrong place.
+
+## Start Chime Behavior
+
+`stt-client` plays an audible chime right before output muting and microphone capture.
+
+Chime backend selection:
+
+- `auto` (default): prefer direct PipeWire playback (`pw-play`), then `paplay`, then synthesized tone, then `canberra`.
+- `pipewire`: direct `pw-play` chime path (best fit for modern GNOME).
+- `paplay`: plays a bell audio file directly.
+- `canberra`: uses desktop event/file playback.
+- `sounddevice`: generated high-frequency chirp.
+
+PTT convenience behavior:
+
+- With `pipewire` backend and no `STT_CHIME_TARGET`, `pw-play` uses PipeWire auto-target routing.
+
+Why this exists:
+
+- Signals intent to people nearby so dictation is less likely to be mistaken for normal conversation.
+- Gives immediate feedback that the hotkey was accepted.
+
+Default order of operations:
+
+1. Play chime.
+2. Optional short cooldown.
+3. Mute output sinks (if enabled).
+4. Record and transcribe.
+5. Restore sink mute state.
 
 ## How `stt-client` Detects Speech
 
@@ -156,10 +206,11 @@ Fallback behavior:
 
 When enabled (default), `stt-client`:
 
-1. Enumerates output sinks with `pactl`.
-2. Stores each sink's current mute state.
-3. Mutes sinks for the capture window.
-4. Restores every sink to its original mute state in a `finally` block.
+1. Plays the start chime.
+2. Enumerates output sinks with `pactl`.
+3. Stores each sink's current mute state.
+4. Mutes sinks for the capture window.
+5. Restores every sink to its original mute state in a `finally` block.
 
 This prevents speaker audio from being interpreted as mic speech and reduces false triggers.
 
@@ -189,7 +240,7 @@ STT_BEAM_SIZE=5
 STT_BEST_OF=5
 STT_VAD_FILTER=1
 STT_LANGUAGE=en
-STT_SOCKET=/home/user/.cache/stt/faster-whisper.sock
+STT_SOCKET=~/.cache/stt/faster-whisper.sock
 ```
 
 After edits, restart daemon:
@@ -208,13 +259,29 @@ systemctl --user restart stt-daemon
 - `--silence-seconds` (larger = waits longer before stopping)
 - `--threshold` and `--noise-multiplier` (fallback RMS path)
 - `--socket-timeout` (bounds daemon request wait time)
+- `--start-chime` / `--no-start-chime`
+- `--chime-backend {auto,pipewire,paplay,canberra,sounddevice}`
+- `--chime-file` (audio file for paplay/canberra backends)
+- `--chime-sink` (optional sink name/id for paplay)
+- `--chime-target` (optional PipeWire target node serial/name)
+- `--chime-role` (PipeWire media role, default `Music`)
+- `--chime-event-id` (desktop event id for canberra)
+- `--chime-freq-hz`, `--chime-duration-ms`, `--chime-volume`, `--chime-cooldown-ms`
 
 ### PTT behavior env vars
 
-- `STT_PTT_DEBOUNCE_MS` (default `1200`)
+- `STT_PTT_DEBOUNCE_MS` (default `0`)
 - `STT_TYPE_DELAY_MS` (default `1`)
 - `STT_PTT_SEND_ENTER` (`1` to press Enter after typing)
 - `STT_CLIENT_BIN` (override client path)
+- `STT_START_CHIME` (`1`/`0`)
+- `STT_CHIME_BACKEND` (`auto`, `pipewire`, `paplay`, `canberra`, `sounddevice`)
+- `STT_CHIME_FILE` (default `/usr/share/sounds/freedesktop/stereo/bell.oga`)
+- `STT_CHIME_SINK` (optional explicit sink, e.g. `@DEFAULT_SINK@`)
+- `STT_CHIME_TARGET` (optional PipeWire target node)
+- `STT_CHIME_ROLE` (PipeWire media role, default `Music`)
+- `STT_CHIME_EVENT_ID` (default `bell`)
+- `STT_CHIME_FREQ_HZ`, `STT_CHIME_DURATION_MS`, `STT_CHIME_VOLUME`, `STT_CHIME_COOLDOWN_MS`
 
 ### Wrapper override env vars
 
@@ -224,6 +291,7 @@ Useful if runtime files are relocated:
 - `STT_CLIENT_PY` (override Python client script path)
 - `STT_DAEMON_PY` (override Python daemon script path)
 - `STT_SOCKET_TIMEOUT` (default client daemon-request timeout)
+- `STT_VENV_DIR` (override venv location used by `venv/env.sh`)
 
 ## Tuning Recipes
 
@@ -266,11 +334,55 @@ stt-client --device 6 --verbose
 stt-client --no-mute-output
 ```
 
+### Disable chime for one run
+
+```bash
+stt-client --no-start-chime
+```
+
+### Lower-volume shorter chime
+
+```bash
+stt-client --chime-volume 0.10 --chime-duration-ms 80
+```
+
+### Force direct PipeWire playback (recommended on modern GNOME)
+
+```bash
+stt-client --chime-backend pipewire --chime-file /home/user/.local/share/stt/chime_hi.wav
+```
+
+If your notification stream is suppressed, use a role with normal playback priority:
+
+```bash
+stt-client --chime-backend pipewire --chime-role Music
+```
+
+### Force direct bell-file playback (paplay)
+
+```bash
+stt-client --chime-backend paplay --chime-file /usr/share/sounds/freedesktop/stereo/bell.oga
+```
+
+### Target a specific output sink for chime
+
+```bash
+stt-client --chime-backend paplay --chime-sink @DEFAULT_SINK@
+```
+
+### Force GNOME desktop event backend
+
+```bash
+stt-client --chime-backend canberra --chime-event-id bell
+```
+
 ## GNOME Keybinding Notes
 
 Current binding points to:
 
 - `/home/user/.local/bin/stt-ptt`
+
+This PTT path is global for X11 and is not limited to GNOME Terminal; it will type into whichever X11 window currently has keyboard focus.
 
 Check full binding object:
 
@@ -300,6 +412,18 @@ PTT key does nothing:
 - Confirm command path in GNOME binding is `/home/user/.local/bin/stt-ptt`.
 - Confirm `xdotool` exists: `xdotool -v`.
 - Confirm session is X11: `echo "$XDG_SESSION_TYPE"`.
+
+No start chime heard:
+
+- Confirm chime is enabled (`STT_START_CHIME` not set to `0`).
+- Confirm system output is not already muted at desktop level.
+- Test directly: `stt-client --verbose --max-seconds 0.5`.
+- Force PipeWire path: `stt-client --verbose --chime-backend pipewire --max-seconds 0.5`.
+- Force bell-file path: `stt-client --verbose --chime-backend paplay --max-seconds 0.5`.
+- Force GNOME sound path: `stt-client --verbose --chime-backend canberra --max-seconds 0.5`.
+- Check routing: `pactl info | rg "Default Sink"` and set `--chime-sink` / `STT_CHIME_SINK` if needed.
+- For PipeWire routing issues: set `STT_CHIME_TARGET` to a concrete node name from `wpctl status`.
+- If chime is clipped by immediate mute, set a tiny holdoff: `--chime-cooldown-ms 30` to `60`.
 
 Too many false activations:
 

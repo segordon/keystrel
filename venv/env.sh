@@ -2,7 +2,21 @@
 # shellcheck shell=bash
 
 _stt_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export VIRTUAL_ENV="$_stt_env_dir"
+
+if [[ -n "${STT_VENV_DIR:-}" ]]; then
+  export VIRTUAL_ENV="$STT_VENV_DIR"
+elif [[ -x "$_stt_env_dir/bin/python" ]]; then
+  export VIRTUAL_ENV="$_stt_env_dir"
+else
+  export VIRTUAL_ENV="$HOME/.venvs/faster-whisper"
+fi
+
+if [[ ! -x "$VIRTUAL_ENV/bin/python" ]]; then
+  printf '[stt-env] expected python at %s\n' "$VIRTUAL_ENV/bin/python" >&2
+  printf '[stt-env] set STT_VENV_DIR to your faster-whisper venv path\n' >&2
+  return 2 2>/dev/null || exit 2
+fi
+
 export PATH="$VIRTUAL_ENV/bin:$PATH"
 
 _stt_site_packages=""

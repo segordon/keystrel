@@ -46,6 +46,10 @@ Current GNOME hotkey:
 
 - `Ctrl+grave` (`<Primary>grave`)
 
+Works in any focused X11 text field, including browser inputs (not just GNOME Terminal).
+PTT now plays a short start chime before muting/listening.
+Default `auto` backend prefers direct PipeWire playback (`pw-play`).
+
 Binding points to:
 
 - `/home/user/.local/bin/stt-ptt`
@@ -67,6 +71,48 @@ Auto-press Enter after typing:
 
 ```bash
 STT_PTT_SEND_ENTER=1 stt-ptt
+```
+
+Disable chime for one run:
+
+```bash
+stt-client --no-start-chime
+```
+
+Force direct PipeWire playback (recommended on modern GNOME):
+
+```bash
+stt-client --chime-backend pipewire --chime-file /home/user/.local/share/stt/chime_hi.wav
+```
+
+Use a non-notification role for audibility:
+
+```bash
+stt-client --chime-backend pipewire --chime-role Music
+```
+
+Pin PipeWire chime to a specific node target:
+
+```bash
+stt-client --chime-backend pipewire --chime-target bluez_output.FC_58_FA_62_40_04.1
+```
+
+Force direct bell-file playback (paplay):
+
+```bash
+stt-client --chime-backend paplay --chime-file /usr/share/sounds/freedesktop/stereo/bell.oga
+```
+
+Target a specific sink for chime playback:
+
+```bash
+stt-client --chime-backend paplay --chime-sink @DEFAULT_SINK@
+```
+
+Force GNOME desktop chime backend:
+
+```bash
+stt-client --chime-backend canberra --chime-event-id bell
 ```
 
 ## Noise and Sensitivity Tuning
@@ -105,6 +151,12 @@ Disable output muting for one run:
 
 ```bash
 stt-client --no-mute-output
+```
+
+Adjust chime level/duration:
+
+```bash
+stt-client --chime-volume 0.10 --chime-duration-ms 80
 ```
 
 ## Common Fixes
@@ -163,6 +215,18 @@ Wrapper override env vars:
 - `STT_CLIENT_PY`
 - `STT_DAEMON_PY`
 - `STT_SOCKET_TIMEOUT`
+- `STT_VENV_DIR`
+- `STT_START_CHIME`
+- `STT_CHIME_BACKEND`
+- `STT_CHIME_FILE`
+- `STT_CHIME_SINK`
+- `STT_CHIME_TARGET`
+- `STT_CHIME_ROLE`
+- `STT_CHIME_EVENT_ID`
+- `STT_CHIME_FREQ_HZ`
+- `STT_CHIME_DURATION_MS`
+- `STT_CHIME_VOLUME`
+- `STT_CHIME_COOLDOWN_MS`
 
 After changing daemon config:
 

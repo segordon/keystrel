@@ -5,16 +5,52 @@ state_dir="${XDG_RUNTIME_DIR:-$HOME/.cache/stt}"
 mkdir -p "$state_dir"
 lock_file="$state_dir/stt-ptt.lock"
 stamp_file="$state_dir/stt-ptt.last"
-debounce_ms="${STT_PTT_DEBOUNCE_MS:-1200}"
+debounce_ms="${STT_PTT_DEBOUNCE_MS:-0}"
 stt_client_bin="${STT_CLIENT_BIN:-$HOME/.local/bin/stt-client}"
 type_delay_ms="${STT_TYPE_DELAY_MS:-1}"
+ptt_chime_enabled="${STT_PTT_CHIME_ENABLED:-1}"
+ptt_chime_backend="${STT_PTT_CHIME_BACKEND:-pipewire}"
+ptt_chime_file="${STT_PTT_CHIME_FILE:-$HOME/.local/share/stt/chime_personality.wav}"
+ptt_chime_target="${STT_PTT_CHIME_TARGET:-}"
+ptt_chime_role="${STT_PTT_CHIME_ROLE:-Music}"
+ptt_chime_volume="${STT_PTT_CHIME_VOLUME:-1.0}"
+ptt_chime_cooldown_ms="${STT_PTT_CHIME_COOLDOWN_MS:-0}"
+ptt_mute_start_delay_ms="${STT_PTT_MUTE_START_DELAY_MS:-}"
+ptt_debug_log="${STT_PTT_DEBUG_LOG:-}"
 
 if ! [[ "$debounce_ms" =~ ^[0-9]+$ ]]; then
-  debounce_ms=1200
+  debounce_ms=0
 fi
 
 if ! [[ "$type_delay_ms" =~ ^[0-9]+$ ]]; then
   type_delay_ms=1
+fi
+
+if ! [[ "$ptt_chime_enabled" =~ ^(0|1)$ ]]; then
+  ptt_chime_enabled=1
+fi
+
+if ! [[ "$ptt_chime_cooldown_ms" =~ ^[0-9]+$ ]]; then
+  ptt_chime_cooldown_ms=0
+fi
+
+if [[ -n "$ptt_mute_start_delay_ms" ]] && ! [[ "$ptt_mute_start_delay_ms" =~ ^[0-9]+$ ]]; then
+  ptt_mute_start_delay_ms=""
+fi
+
+if [[ -z "$ptt_chime_target" ]] && command -v pactl >/dev/null 2>&1; then
+  default_sink="$(pactl info 2>/dev/null | sed -n 's/^Default Sink: //p')"
+  if [[ -n "$default_sink" ]]; then
+    ptt_chime_target="$default_sink"
+  fi
+fi
+
+if [[ -z "$ptt_mute_start_delay_ms" ]]; then
+  if [[ "$ptt_chime_target" == bluez_output.* ]]; then
+    ptt_mute_start_delay_ms=1200
+  else
+    ptt_mute_start_delay_ms=0
+  fi
 fi
 
 if ! command -v flock >/dev/null 2>&1; then
@@ -37,6 +73,118 @@ if ! command -v xdotool >/dev/null 2>&1; then
   exit 4
 fi
 
+log_debug() {
+  [[ -n "$ptt_debug_log" ]] || return 0
+  printf '%s %s\n' "$(date +'%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$ptt_debug_log" 2>/dev/null || true
+}
+
+run_chime_pipewire() {
+  command -v pw-play >/dev/null 2>&1 || return 1
+  [[ -f "$ptt_chime_file" ]] || return 1
+
+  if [[ -n "$ptt_chime_target" ]]; then
+    pw-play --target "$ptt_chime_target" --media-role "$ptt_chime_role" --volume "$ptt_chime_volume" --latency 20ms "$ptt_chime_file" >/dev/null 2>&1
+  else
+    pw-play --media-role "$ptt_chime_role" --volume "$ptt_chime_volume" --latency 20ms "$ptt_chime_file" >/dev/null 2>&1
+  fi
+}
+
+run_chime_paplay() {
+  command -v paplay >/dev/null 2>&1 || return 1
+  [[ -f "$ptt_chime_file" ]] || return 1
+  paplay "$ptt_chime_file" >/dev/null 2>&1
+}
+
+run_chime_canberra() {
+  command -v canberra-gtk-play >/dev/null 2>&1 || return 1
+  if [[ -f "$ptt_chime_file" ]]; then
+    canberra-gtk-play -d "stt ptt" -f "$ptt_chime_file" >/dev/null 2>&1
+  else
+    canberra-gtk-play -d "stt ptt" -i bell >/dev/null 2>&1
+  fi
+}
+
+play_ptt_chime() {
+  [[ "$ptt_chime_enabled" == "1" ]] || return 0
+
+  played=0
+
+  case "$ptt_chime_backend" in
+    auto)
+      if run_chime_pipewire; then
+        played=1
+        log_debug "chime ok backend=pipewire target=${ptt_chime_target:-auto}"
+      elif run_chime_paplay; then
+        played=1
+        log_debug "chime ok backend=paplay"
+      elif run_chime_canberra; then
+        played=1
+        log_debug "chime ok backend=canberra"
+      fi
+      ;;
+    pipewire)
+      if run_chime_pipewire; then
+        played=1
+        log_debug "chime ok backend=pipewire target=${ptt_chime_target:-auto}"
+      elif run_chime_paplay; then
+        played=1
+        log_debug "chime fallback backend=paplay"
+      elif run_chime_canberra; then
+        played=1
+        log_debug "chime fallback backend=canberra"
+      fi
+      ;;
+    paplay)
+      if run_chime_paplay; then
+        played=1
+        log_debug "chime ok backend=paplay"
+      elif run_chime_pipewire; then
+        played=1
+        log_debug "chime fallback backend=pipewire target=${ptt_chime_target:-auto}"
+      elif run_chime_canberra; then
+        played=1
+        log_debug "chime fallback backend=canberra"
+      fi
+      ;;
+    canberra)
+      if run_chime_canberra; then
+        played=1
+        log_debug "chime ok backend=canberra"
+      elif run_chime_pipewire; then
+        played=1
+        log_debug "chime fallback backend=pipewire target=${ptt_chime_target:-auto}"
+      elif run_chime_paplay; then
+        played=1
+        log_debug "chime fallback backend=paplay"
+      fi
+      ;;
+    none)
+      ;;
+    *)
+      if run_chime_pipewire; then
+        played=1
+        log_debug "chime ok backend=pipewire target=${ptt_chime_target:-auto}"
+      elif run_chime_paplay; then
+        played=1
+        log_debug "chime fallback backend=paplay"
+      elif run_chime_canberra; then
+        played=1
+        log_debug "chime fallback backend=canberra"
+      fi
+      ;;
+  esac
+
+  if [[ "$played" != "1" ]]; then
+    log_debug "chime failed backend=${ptt_chime_backend} file=${ptt_chime_file} target=${ptt_chime_target}"
+  fi
+
+  if (( ptt_chime_cooldown_ms > 0 )); then
+    chime_wait_s=$((ptt_chime_cooldown_ms / 1000))
+    chime_wait_ms=$((ptt_chime_cooldown_ms % 1000))
+    sleep "${chime_wait_s}.$(printf '%03d' "$chime_wait_ms")"
+  fi
+}
+
 exec 9>"$lock_file"
 if ! flock -n 9; then
   exit 0
@@ -51,7 +199,10 @@ if [[ -f "$stamp_file" ]]; then
 fi
 printf '%s' "$now_ms" >"$stamp_file"
 
-text="$("$stt_client_bin" "$@")"
+play_ptt_chime
+
+log_debug "capture start mute_delay_ms=${ptt_mute_start_delay_ms}"
+text="$(STT_START_CHIME=0 STT_MUTE_START_DELAY_MS="$ptt_mute_start_delay_ms" "$stt_client_bin" "$@")"
 text="${text//$'\r'/}"
 text="${text//$'\n'/ }"
 

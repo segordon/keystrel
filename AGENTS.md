@@ -102,7 +102,7 @@ Two separate protections were added to fix real issues seen in testing.
 2. PTT lock + debounce (`stt-ptt`)
    - Lock file: `${XDG_RUNTIME_DIR:-$HOME/.cache/stt}/stt-ptt.lock`
    - Debounce stamp: `${XDG_RUNTIME_DIR:-$HOME/.cache/stt}/stt-ptt.last`
-   - Default debounce: `1200ms` via `STT_PTT_DEBOUNCE_MS`
+   - Default debounce: `0ms` via `STT_PTT_DEBOUNCE_MS` (lock handles overlap protection)
    - Prevents key-repeat spawning multiple jobs and delayed/batched output typing.
 
 ### 6) PTT integration for GNOME Terminal
@@ -151,6 +151,29 @@ Additional robustness/security improvements were applied:
 - Client/daemon env parsing now tolerates malformed env values and falls back to defaults (with warnings) instead of traceback crashes.
 - Wrapper scripts were de-hardcoded to use `$HOME` and overridable env paths.
 - PTT debounce/type delay env values are validated before use.
+
+### 10) Audible start chime before listen
+
+`stt-client` now plays a short chime before muting output and beginning capture.
+
+Purpose:
+
+- Gives nearby people a clear cue that dictation mode is starting.
+- Provides immediate feedback that PTT activation succeeded.
+
+Relevant client options/env:
+
+- `--start-chime` / `--no-start-chime` (`STT_START_CHIME`)
+- `--chime-backend` (`STT_CHIME_BACKEND`) with `auto/pipewire/paplay/canberra/sounddevice`
+- `--chime-file` (`STT_CHIME_FILE`) for file-backed bell playback
+- `--chime-sink` (`STT_CHIME_SINK`) for explicit paplay output routing
+- `--chime-target` (`STT_CHIME_TARGET`) for explicit PipeWire node routing
+- `--chime-role` (`STT_CHIME_ROLE`) for PipeWire stream role control
+- `--chime-event-id` (`STT_CHIME_EVENT_ID`)
+- `--chime-freq-hz` (`STT_CHIME_FREQ_HZ`)
+- `--chime-duration-ms` (`STT_CHIME_DURATION_MS`)
+- `--chime-volume` (`STT_CHIME_VOLUME`)
+- `--chime-cooldown-ms` (`STT_CHIME_COOLDOWN_MS`)
 
 ## Accuracy Tuning Changes (English)
 
