@@ -1,7 +1,7 @@
 # Keystrel Quickstart and Operating Guide
 
 <p align="center">
-  <img src="docs/keystrel_logo.png" alt="Keystrel mascot logo" width="220" />
+  <img src="docs/keystrel_logo.jpg" alt="Keystrel mascot logo" width="220" />
 </p>
 
 <p align="center">
