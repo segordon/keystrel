@@ -35,14 +35,21 @@ Provide fast, local, GPU-accelerated speech-to-text (STT) for terminal workflows
 ### 2) Warm daemon architecture
 
 - Added daemon script: `/home/user/.local/lib/stt/stt_daemon.py`
-- Daemon runs a persistent Whisper model and serves requests over Unix socket.
+- Daemon runs a persistent Whisper model and serves requests over Unix socket and optional TCP.
 - Socket default: `/home/user/.cache/stt/faster-whisper.sock`
-- Protocol: single-line JSON request/response over AF_UNIX stream.
+- TCP defaults (when enabled): `100.94.143.124:8765`
+- Protocol: single-line JSON request/response over AF_UNIX or TCP stream.
 
-Request (minimum):
+Unix request (minimum):
 
 ```json
 {"audio_path":"/tmp/file.wav"}
+```
+
+TCP request (minimum):
+
+```json
+{"audio_b64":"<base64 wav bytes>","auth_token":"<shared-token>"}
 ```
 
 Optional request fields supported:
@@ -52,6 +59,12 @@ Optional request fields supported:
 - `vad_filter`
 - `beam_size`
 - `best_of`
+
+TCP safeguards:
+
+- requires `auth_token` that matches `STT_SERVER_TOKEN`
+- rejects `audio_path` in TCP mode
+- enforces request/audio size limits (`STT_MAX_REQUEST_BYTES`, `STT_MAX_AUDIO_BYTES`)
 
 Response contains:
 
@@ -65,13 +78,14 @@ Response contains:
 
 - Added client script: `/home/user/.local/lib/stt/stt_client.py`
 - Captures mic audio with `sounddevice`, VAD-like stop logic based on RMS threshold + trailing silence.
-- Writes temp WAV, sends to daemon, prints transcript to stdout.
+- Writes temp WAV, sends to local daemon (Unix) or remote daemon (TCP), prints transcript to stdout.
 
 Key behavior:
 
 - Returns empty output if voice was never detected (`started_voice` guard).
 - Supports overrides for language/vad/beam/best_of.
 - Supports device listing via `--list-devices`.
+- Supports remote transport with `STT_SERVER=tcp://<host>:<port>` and `STT_SERVER_TOKEN`.
 - Uses WebRTC VAD gating (when available) to reduce fan/noise false triggers.
 - Requires consecutive speech-positive blocks before capture start.
 - Keeps short pre-roll audio so initial words are not clipped.
@@ -151,6 +165,7 @@ Additional robustness/security improvements were applied:
 - Client/daemon env parsing now tolerates malformed env values and falls back to defaults (with warnings) instead of traceback crashes.
 - Wrapper scripts were de-hardcoded to use `$HOME` and overridable env paths.
 - PTT debounce/type delay env values are validated before use.
+- Remote TCP requests now require shared-token auth and bounded payload size.
 
 ### 10) Audible start chime before listen
 
@@ -174,6 +189,28 @@ Relevant client options/env:
 - `--chime-duration-ms` (`STT_CHIME_DURATION_MS`)
 - `--chime-volume` (`STT_CHIME_VOLUME`)
 - `--chime-cooldown-ms` (`STT_CHIME_COOLDOWN_MS`)
+
+### 11) Centralized GPU inference over Tailscale
+
+The same daemon process now supports optional TCP transport for Tailnet clients.
+
+Server-side env (GPU node):
+
+- `STT_TCP_LISTEN=100.94.143.124`
+- `STT_TCP_PORT=8765`
+- `STT_SERVER_TOKEN=<long-random-secret>`
+- `STT_MAX_REQUEST_BYTES=10485760`
+- `STT_MAX_AUDIO_BYTES=6291456`
+
+Client-side env (any node):
+
+- `STT_SERVER=tcp://100.94.143.124:8765`
+- `STT_SERVER_TOKEN=<same-secret>`
+- `STT_SERVER_TIMEOUT=<seconds>`
+
+Important security note:
+
+- Never commit real `STT_SERVER_TOKEN` values to git.
 
 ## Accuracy Tuning Changes (English)
 
@@ -247,7 +284,7 @@ stt-client --verbose
 ### PTT behavior tuning
 
 ```bash
-STT_PTT_DEBOUNCE_MS=900 stt-ptt
+STT_PTT_DEBOUNCE_MS=0 stt-ptt
 STT_TYPE_DELAY_MS=0 stt-ptt
 STT_PTT_SEND_ENTER=1 stt-ptt
 ```

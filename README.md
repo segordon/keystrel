@@ -27,14 +27,14 @@ There are 3 layers:
 
 1. `stt-daemon` (always-on backend)
    - Loads Whisper model once and keeps it warm in VRAM.
-   - Accepts requests over Unix socket.
+   - Accepts requests over Unix socket and optional TCP (for Tailnet clients).
    - Returns transcript JSON.
 
 2. `stt-client` (capture/transcribe command)
    - Records mic audio.
    - Plays a short start chime before muting and listening.
    - Applies speech gating to reject environmental noise.
-   - Sends WAV path to daemon.
+   - Sends local WAV path over Unix socket or WAV bytes to remote TCP server.
    - Prints transcript to stdout.
 
 3. `stt-ptt` (desktop typing integration)
@@ -43,25 +43,37 @@ There are 3 layers:
    - Types text into active window via `xdotool`.
    - Optional Enter key submit.
 
-## File Layout
+## System Flow Chart
 
-Active runtime files (source of truth):
+```mermaid
+flowchart LR
+    U[User presses PTT\nCtrl+grave] --> P[stt-ptt]
+    P --> C1[Play start chime\nlocal audio output]
+    C1 --> C2[stt-client capture\nVAD + noise gating]
+    C2 --> D{Transport mode}
 
-- `/home/user/.local/lib/stt/stt_daemon.py`
-- `/home/user/.local/lib/stt/stt_client.py`
-- `/home/user/.local/bin/stt-daemon`
-- `/home/user/.local/bin/stt-client`
-- `/home/user/.local/bin/stt-ptt`
-- `/home/user/.config/stt-daemon.env`
-- `/home/user/.config/systemd/user/stt-daemon.service`
-- `/home/user/.venvs/faster-whisper/env.sh`
+    D -->|Local default| L1[Unix socket\n~/.cache/stt/faster-whisper.sock]
+    L1 --> S[stt-daemon\nGPU faster-whisper model]
 
-Development mirror:
+    D -->|Remote Tailnet| R1[TCP + auth token\ntcp://100.94.143.124:8765]
+    R1 --> S
 
-- `/home/user/Documents/stt/*`
+    S --> T[Transcript JSON response]
+    T --> P2[stt-ptt types text\ninto focused X11 field]
+    P2 --> A[Terminal / Browser / Editor]
+```
 
-Important: repository wrapper scripts in `bin/` are self-contained and resolve to this repo by default.
-You can still override script/venv locations with env vars when needed.
+## Repository Layout
+
+This repository keeps only project-local paths and templates:
+
+- `lib/` Python implementation (`stt_client.py`, `stt_daemon.py`)
+- `bin/` CLI wrappers (`stt-client`, `stt-daemon`, `stt-ptt`)
+- `config/` example daemon env configuration
+- `venv/` venv activation helper
+- `client.env.example` remote client environment template
+
+Runtime install locations (user home paths, service unit paths, and machine-specific env files) are intentionally not listed here.
 
 ## Prerequisites and Installed Dependencies
 
@@ -103,6 +115,47 @@ View logs live:
 ```bash
 journalctl --user -u stt-daemon -f
 ```
+
+## Centralized GPU over Tailscale
+
+You can run one GPU daemon for your Tailnet and use lightweight clients from other machines.
+No separate server app is required; the same `stt-daemon` process can expose both transports.
+
+### Server node (GPU host)
+
+Set in `/home/user/.config/stt-daemon.env`:
+
+```dotenv
+STT_SOCKET=~/.cache/stt/faster-whisper.sock
+STT_TCP_LISTEN=100.94.143.124
+STT_TCP_PORT=8765
+STT_SERVER_TOKEN=REPLACE_WITH_LONG_RANDOM_SECRET
+STT_MAX_REQUEST_BYTES=10485760
+STT_MAX_AUDIO_BYTES=6291456
+```
+
+Then restart daemon:
+
+```bash
+systemctl --user restart stt-daemon
+```
+
+### Client node (any Tailnet machine)
+
+Set client env (shell profile or launcher env):
+
+```bash
+export STT_SERVER="tcp://100.94.143.124:8765"
+export STT_SERVER_TOKEN="REPLACE_WITH_SAME_SECRET"
+```
+
+You can also start from the provided template:
+
+```bash
+cp client.env.example .env
+```
+
+`stt-client` and `stt-ptt` then keep local capture/chime/typing, while transcription runs on the remote GPU daemon.
 
 ## Quickstart (Daily Usage)
 
@@ -241,6 +294,11 @@ STT_BEST_OF=5
 STT_VAD_FILTER=1
 STT_LANGUAGE=en
 STT_SOCKET=~/.cache/stt/faster-whisper.sock
+STT_TCP_LISTEN=100.94.143.124
+STT_TCP_PORT=8765
+STT_SERVER_TOKEN=REPLACE_WITH_LONG_RANDOM_SECRET
+STT_MAX_REQUEST_BYTES=10485760
+STT_MAX_AUDIO_BYTES=6291456
 ```
 
 After edits, restart daemon:
@@ -259,6 +317,10 @@ systemctl --user restart stt-daemon
 - `--silence-seconds` (larger = waits longer before stopping)
 - `--threshold` and `--noise-multiplier` (fallback RMS path)
 - `--socket-timeout` (bounds daemon request wait time)
+- `--server` (remote endpoint, e.g. `tcp://100.94.143.124:8765`)
+- `--server-token` (shared token for remote TCP mode)
+- `--server-timeout` (bounds remote connect/read wait time)
+- `--mute-start-delay-ms` (delay output muting after capture starts)
 - `--start-chime` / `--no-start-chime`
 - `--chime-backend {auto,pipewire,paplay,canberra,sounddevice}`
 - `--chime-file` (audio file for paplay/canberra backends)
@@ -274,6 +336,10 @@ systemctl --user restart stt-daemon
 - `STT_TYPE_DELAY_MS` (default `1`)
 - `STT_PTT_SEND_ENTER` (`1` to press Enter after typing)
 - `STT_CLIENT_BIN` (override client path)
+- `STT_SERVER` (remote endpoint, e.g. `tcp://100.94.143.124:8765`)
+- `STT_SERVER_TOKEN` (shared token for remote mode)
+- `STT_SERVER_TIMEOUT` (remote connect/read timeout)
+- `STT_MUTE_START_DELAY_MS` (delay mute start; useful for Bluetooth chime audibility)
 - `STT_START_CHIME` (`1`/`0`)
 - `STT_CHIME_BACKEND` (`auto`, `pipewire`, `paplay`, `canberra`, `sounddevice`)
 - `STT_CHIME_FILE` (default `/usr/share/sounds/freedesktop/stereo/bell.oga`)
@@ -406,6 +472,13 @@ No transcript appears:
 - Test client directly: `stt-client --verbose`
 - Verify socket exists: `/home/user/.cache/stt/faster-whisper.sock`
 - Expected secure permissions: socket dir `drwx------`, socket file `srw-------`
+
+Remote mode issues (`STT_SERVER` set):
+
+- Verify TCP listener on server node: `ss -ltn | rg 8765`
+- Verify Tailnet reachability: `tailscale ping 100.94.143.124`
+- Verify token match on both sides: `STT_SERVER_TOKEN`
+- Force explicit call: `STT_SERVER=tcp://100.94.143.124:8765 STT_SERVER_TOKEN=... stt-client --verbose --no-start-chime`
 
 PTT key does nothing:
 

@@ -40,6 +40,41 @@ Use specific mic:
 stt-client --device 6 --verbose
 ```
 
+## Tailscale Remote Mode
+
+Server node (`/home/user/.config/stt-daemon.env`):
+
+```dotenv
+STT_TCP_LISTEN=100.94.143.124
+STT_TCP_PORT=8765
+STT_SERVER_TOKEN=REPLACE_WITH_LONG_RANDOM_SECRET
+```
+
+Restart server daemon:
+
+```bash
+systemctl --user restart stt-daemon
+```
+
+Client node env:
+
+```bash
+export STT_SERVER="tcp://100.94.143.124:8765"
+export STT_SERVER_TOKEN="REPLACE_WITH_SAME_SECRET"
+```
+
+Or copy template:
+
+```bash
+cp client.env.example .env
+```
+
+Remote client test:
+
+```bash
+stt-client --verbose --no-start-chime
+```
+
 ## Push To Talk
 
 Current GNOME hotkey:
@@ -173,6 +208,18 @@ Verify socket exists:
 ls -l /home/user/.cache/stt/faster-whisper.sock
 ```
 
+Verify Tailnet TCP listener on server:
+
+```bash
+ss -ltn | rg 8765
+```
+
+Remote mode quick check from client node:
+
+```bash
+STT_SERVER=tcp://100.94.143.124:8765 STT_SERVER_TOKEN=... stt-client --verbose --no-start-chime
+```
+
 Expected secure permissions:
 
 - socket dir: `drwx------`
@@ -215,7 +262,14 @@ Wrapper override env vars:
 - `STT_CLIENT_PY`
 - `STT_DAEMON_PY`
 - `STT_SOCKET_TIMEOUT`
+- `STT_SERVER`
+- `STT_SERVER_TOKEN`
+- `STT_SERVER_TIMEOUT`
 - `STT_VENV_DIR`
+- `STT_TCP_LISTEN`
+- `STT_TCP_PORT`
+- `STT_MAX_REQUEST_BYTES`
+- `STT_MAX_AUDIO_BYTES`
 - `STT_START_CHIME`
 - `STT_CHIME_BACKEND`
 - `STT_CHIME_FILE`

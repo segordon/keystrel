@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 from collections import deque
 from pathlib import Path
 
@@ -96,6 +98,22 @@ def parse_args():
         "--socket",
         default=os.environ.get("STT_SOCKET", "~/.cache/stt/faster-whisper.sock"),
         help="Unix socket path",
+    )
+    parser.add_argument(
+        "--server",
+        default=os.environ.get("STT_SERVER", ""),
+        help="optional remote server URL, e.g. tcp://100.94.143.124:8765",
+    )
+    parser.add_argument(
+        "--server-token",
+        default=os.environ.get("STT_SERVER_TOKEN", ""),
+        help="shared auth token for remote server mode",
+    )
+    parser.add_argument(
+        "--server-timeout",
+        type=float,
+        default=parse_env_float("STT_SERVER_TIMEOUT", 30.0),
+        help="seconds before remote server connect/read timeout",
     )
     parser.add_argument(
         "--sample-rate",
@@ -325,6 +343,9 @@ def parse_args():
     args.pre_roll_seconds = max(0.0, args.pre_roll_seconds)
     args.noise_multiplier = max(1.0, args.noise_multiplier)
     args.socket_timeout = max(0.1, args.socket_timeout)
+    args.server_timeout = max(0.1, args.server_timeout)
+    args.server = args.server.strip()
+    args.server_token = args.server_token.strip()
     args.chime_freq_hz = max(100.0, min(4000.0, args.chime_freq_hz))
     args.chime_duration_ms = max(20, args.chime_duration_ms)
     args.chime_volume = max(0.0, min(1.0, args.chime_volume))
@@ -335,6 +356,45 @@ def parse_args():
     args.chime_role = args.chime_role.strip() or "Music"
     args.chime_event_id = args.chime_event_id.strip() or "bell"
     return args
+
+
+def parse_server_endpoint(server_url):
+    text = server_url.strip()
+    if not text:
+        return None
+
+    if "://" not in text:
+        text = f"tcp://{text}"
+
+    parsed = urlparse(text)
+    if parsed.scheme.lower() != "tcp":
+        raise ValueError(f"unsupported STT_SERVER scheme: {parsed.scheme or 'none'}")
+
+    if parsed.path not in {"", "/"}:
+        raise ValueError("STT_SERVER must not include a path; use tcp://host:port")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError("STT_SERVER is missing host")
+
+    port = parsed.port if parsed.port is not None else 8765
+    if port <= 0 or port > 65535:
+        raise ValueError(f"invalid STT_SERVER port: {port}")
+
+    return host, port
+
+
+def build_transcription_options(args):
+    payload = {}
+    if args.language.strip():
+        payload["language"] = args.language.strip()
+    if args.vad_filter is not None:
+        payload["vad_filter"] = args.vad_filter
+    if args.beam_size is not None:
+        payload["beam_size"] = args.beam_size
+    if args.best_of is not None:
+        payload["best_of"] = args.best_of
+    return payload
 
 
 def list_output_sinks():
@@ -831,7 +891,7 @@ def play_start_chime(args):
         time.sleep(args.chime_cooldown_ms / 1000.0)
 
 
-def send_request(socket_path, payload, timeout_s):
+def send_unix_request(socket_path, payload, timeout_s):
     data = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout_s)
@@ -852,6 +912,40 @@ def send_request(socket_path, payload, timeout_s):
     return json.loads(response.decode("utf-8"))
 
 
+def send_tcp_request(host, port, payload, timeout_s, max_response_bytes=2 * 1024 * 1024):
+    data = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s) as sock:
+            sock.settimeout(timeout_s)
+            try:
+                sock.sendall(data)
+                response = b""
+                while not response.endswith(b"\n"):
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if len(response) > max_response_bytes:
+                        raise RuntimeError("remote response exceeded size limit")
+            except socket.timeout as exc:
+                raise TimeoutError(
+                    f"remote server request timed out after {timeout_s:.1f}s"
+                ) from exc
+    except socket.timeout as exc:
+        raise TimeoutError(f"remote server connect timed out after {timeout_s:.1f}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"remote server connection failed: {exc}") from exc
+
+    if not response:
+        raise RuntimeError("empty response from remote server")
+
+    try:
+        return json.loads(response.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid JSON response from remote server: {exc}") from exc
+
+
 def main():
     args = parse_args()
 
@@ -864,11 +958,25 @@ def main():
         return
 
     try:
-        socket_path = Path(args.socket).expanduser()
-        if not socket_path.exists():
+        try:
+            remote_endpoint = parse_server_endpoint(args.server)
+        except ValueError as exc:
+            print(f"[stt-client] invalid remote server configuration: {exc}", file=sys.stderr)
+            sys.exit(2)
+
+        socket_path = None
+        if remote_endpoint is None:
+            socket_path = Path(args.socket).expanduser()
+            if not socket_path.exists():
+                print(
+                    f"[stt-client] daemon socket not found: {socket_path}\n"
+                    "[stt-client] start it with: systemctl --user start stt-daemon",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        elif not args.server_token:
             print(
-                f"[stt-client] daemon socket not found: {socket_path}\n"
-                "[stt-client] start it with: systemctl --user start stt-daemon",
+                "[stt-client] remote mode requires STT_SERVER_TOKEN or --server-token",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -908,17 +1016,16 @@ def main():
 
         try:
             sf.write(str(wav_path), audio, args.sample_rate)
-            payload = {"audio_path": str(wav_path)}
-            if args.language.strip():
-                payload["language"] = args.language.strip()
-            if args.vad_filter is not None:
-                payload["vad_filter"] = args.vad_filter
-            if args.beam_size is not None:
-                payload["beam_size"] = args.beam_size
-            if args.best_of is not None:
-                payload["best_of"] = args.best_of
+            payload = build_transcription_options(args)
 
-            response = send_request(socket_path, payload, args.socket_timeout)
+            if remote_endpoint is None:
+                payload["audio_path"] = str(wav_path)
+                response = send_unix_request(socket_path, payload, args.socket_timeout)
+            else:
+                host, port = remote_endpoint
+                payload["audio_b64"] = base64.b64encode(wav_path.read_bytes()).decode("ascii")
+                payload["auth_token"] = args.server_token
+                response = send_tcp_request(host, port, payload, args.server_timeout)
         except Exception as exc:  # noqa: BLE001
             print(f"[stt-client] request failed: {exc}", file=sys.stderr)
             sys.exit(4)
