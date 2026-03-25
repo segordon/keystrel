@@ -1,7 +1,7 @@
 # Keystrel
 
 <p align="center">
-  <img src="docs/keystrel_logo.svg" alt="Keystrel mascot logo" width="220" />
+  <img src="docs/keystrel_logo.png" alt="Keystrel mascot logo" width="220" />
 </p>
 
 <p align="center">
