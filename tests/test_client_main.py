@@ -174,6 +174,35 @@ class ClientMainFlowTests(unittest.TestCase):
 
         confirm_mute.assert_called_once_with(args, {"1": False})
 
+    def test_mute_start_delay_applies_mute_during_capture_tick(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            socket_path = Path(tmp_dir) / "daemon.sock"
+            socket_path.write_text("present", encoding="utf-8")
+            args = _base_args(
+                socket=str(socket_path),
+                mute_output=True,
+                mute_start_delay_ms=120,
+                mute_settle_ms=300,
+            )
+
+            def _record_side_effect(_args, on_tick):
+                on_tick(0.05)
+                on_tick(0.15)
+                return _FakeAudio(0)
+
+            with (
+                mock.patch.object(keystrel_client, "parse_args", return_value=args),
+                mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+                mock.patch.object(keystrel_client, "play_start_chime"),
+                mock.patch.object(keystrel_client, "mute_output_during_capture", return_value={"1": False}) as mute_now,
+                mock.patch.object(keystrel_client, "confirm_output_mute_before_capture") as confirm_mute,
+                mock.patch.object(keystrel_client, "record_until_silence", side_effect=_record_side_effect),
+            ):
+                keystrel_client.main()
+
+        mute_now.assert_called_once_with(args)
+        confirm_mute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

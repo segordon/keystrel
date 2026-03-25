@@ -654,8 +654,11 @@ def auto_select_input_device(args):
 
     try:
         devices = sd.query_devices()
-        default_pair = sd.default.device
-        default_input_index = int(default_pair[0])
+        default_device = sd.default.device
+        try:
+            default_input_index = int(default_device[0])
+        except Exception:  # noqa: BLE001
+            default_input_index = int(default_device)
     except Exception:  # noqa: BLE001
         return None, False
 

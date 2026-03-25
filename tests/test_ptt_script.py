@@ -24,6 +24,7 @@ class PTTScriptBehaviorTests(unittest.TestCase):
 
         self.xdotool_log = self.temp_dir / "xdotool.log"
         self.client_log = self.temp_dir / "client.log"
+        self.client_env_log = self.temp_dir / "client-env.log"
 
         _write_executable(
             self.fake_bin / "xdotool",
@@ -38,6 +39,14 @@ printf '%s\n' "$*" >>"${XDOTOOL_LOG:?}"
             """#!/usr/bin/env bash
 set -euo pipefail
 printf 'call\n' >>"${KEYSTREL_CLIENT_CALL_LOG:?}"
+if [[ -n "${KEYSTREL_CLIENT_ENV_LOG:-}" ]]; then
+  printf 'mute_start_delay=%s input_device=%s sample_rate=%s mute_settle=%s start_chime=%s\n' \
+    "${KEYSTREL_MUTE_START_DELAY_MS:-}" \
+    "${KEYSTREL_INPUT_DEVICE:-}" \
+    "${KEYSTREL_SAMPLE_RATE:-}" \
+    "${KEYSTREL_MUTE_SETTLE_MS:-}" \
+    "${KEYSTREL_START_CHIME:-}" >>"${KEYSTREL_CLIENT_ENV_LOG}"
+fi
 if [[ -n "${KEYSTREL_CLIENT_SLEEP_MS:-}" ]]; then
   s=$((KEYSTREL_CLIENT_SLEEP_MS / 1000))
   ms=$((KEYSTREL_CLIENT_SLEEP_MS % 1000))
@@ -89,6 +98,39 @@ printf '%s' "${KEYSTREL_CLIENT_TEXT:-hello world}"
         client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(xdotool_lines), 1)
         self.assertEqual(len(client_lines), 1)
+
+    def test_forwards_mute_and_input_env_to_client(self):
+        result = self._run_ptt(
+            {
+                "KEYSTREL_PTT_MUTE_START_DELAY_MS": "240",
+                "KEYSTREL_INPUT_DEVICE": "UM10",
+                "KEYSTREL_SAMPLE_RATE": "48000",
+                "KEYSTREL_MUTE_SETTLE_MS": "350",
+                "KEYSTREL_CLIENT_ENV_LOG": str(self.client_env_log),
+                "KEYSTREL_CLIENT_TEXT": "captured",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout} stderr={result.stderr}")
+        env_line = self.client_env_log.read_text(encoding="utf-8").strip()
+        self.assertIn("mute_start_delay=240", env_line)
+        self.assertIn("input_device=UM10", env_line)
+        self.assertIn("sample_rate=48000", env_line)
+        self.assertIn("mute_settle=350", env_line)
+        self.assertIn("start_chime=0", env_line)
+
+    def test_invalid_ptt_mute_delay_falls_back_to_zero(self):
+        result = self._run_ptt(
+            {
+                "KEYSTREL_PTT_MUTE_START_DELAY_MS": "not-a-number",
+                "KEYSTREL_CLIENT_ENV_LOG": str(self.client_env_log),
+                "KEYSTREL_CLIENT_TEXT": "captured",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout} stderr={result.stderr}")
+        env_line = self.client_env_log.read_text(encoding="utf-8").strip()
+        self.assertIn("mute_start_delay=0", env_line)
 
     def test_lock_prevents_overlapping_runs(self):
         env = dict(self.base_env)

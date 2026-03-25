@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+
 from tests._module_loader import load_client_module
 
 
@@ -23,6 +25,49 @@ def _args(**overrides):
     }
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def _record_args(**overrides):
+    base = {
+        "max_seconds": 0.5,
+        "min_seconds": 0.0,
+        "silence_seconds": 0.1,
+        "threshold": 0.02,
+        "block_seconds": 0.1,
+        "pre_roll_seconds": 0.0,
+        "start_speech_chunks": 1,
+        "speech_ratio": 0.6,
+        "noise_multiplier": 2.5,
+        "webrtcvad": True,
+        "webrtcvad_mode": 2,
+        "webrtcvad_frame_ms": 20,
+    }
+    base.update(overrides)
+    return _args(**base)
+
+
+class _PreloadedQueue:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def get(self, timeout=None):  # noqa: ARG002
+        if self._chunks:
+            return self._chunks.pop(0)
+        raise keystrel_client.queue.Empty
+
+    def put(self, item):
+        self._chunks.append(item)
+
+
+class _NoopInputStream:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):  # noqa: ARG002
+        return False
 
 
 class ClientMuteControlTests(unittest.TestCase):
@@ -185,6 +230,83 @@ class ClientInputDeviceSelectionTests(unittest.TestCase):
 
         self.assertIsNone(selected)
         self.assertFalse(auto_selected)
+
+    def test_auto_select_handles_single_default_device_int(self):
+        args = _args(verbose=True, device=None)
+        devices = [
+            {"name": "hdmi", "max_input_channels": 0, "max_output_channels": 2},
+            {"name": "UM10: USB Audio", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "default", "max_input_channels": 64, "max_output_channels": 64},
+        ]
+        with (
+            mock.patch.object(keystrel_client.sd, "query_devices", return_value=devices, create=True),
+            mock.patch.object(
+                keystrel_client.sd,
+                "default",
+                SimpleNamespace(device=2),
+                create=True,
+            ),
+            mock.patch.object(keystrel_client.sd, "check_input_settings", return_value=None, create=True),
+        ):
+            selected, auto_selected = keystrel_client.auto_select_input_device(args)
+
+        self.assertEqual(selected, 1)
+        self.assertTrue(auto_selected)
+
+
+class ClientRecordUntilSilenceTests(unittest.TestCase):
+    def test_record_until_silence_returns_empty_when_voice_never_starts(self):
+        args = _record_args(max_seconds=0.45, threshold=1.0, pre_roll_seconds=0.0)
+        chunk = np.zeros((1600, 1), dtype=np.float32)
+
+        monotonic_values = iter([0.0, 0.12, 0.24, 0.36, 0.48])
+
+        with (
+            mock.patch.object(keystrel_client, "build_webrtc_vad", return_value=None),
+            mock.patch.object(
+                keystrel_client.queue,
+                "Queue",
+                side_effect=lambda: _PreloadedQueue([chunk, chunk]),
+            ),
+            mock.patch.object(keystrel_client.sd, "InputStream", _NoopInputStream, create=True),
+            mock.patch.object(keystrel_client.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+        ):
+            audio = keystrel_client.record_until_silence(args)
+
+        self.assertEqual(audio.size, 0)
+
+    def test_record_until_silence_keeps_preroll_and_stops_on_trailing_silence(self):
+        args = _record_args(
+            pre_roll_seconds=0.2,
+            min_seconds=0.0,
+            silence_seconds=0.1,
+            start_speech_chunks=1,
+        )
+        quiet = np.zeros((1600, 1), dtype=np.float32)
+        voice = np.full((1600, 1), 0.4, dtype=np.float32)
+
+        monotonic_values = iter([0.0, 0.10, 0.20, 0.36])
+
+        with (
+            mock.patch.object(keystrel_client, "build_webrtc_vad", return_value=object()),
+            mock.patch.object(
+                keystrel_client,
+                "speech_ratio_in_chunk",
+                side_effect=[0.0, 1.0, 0.0],
+            ),
+            mock.patch.object(
+                keystrel_client.queue,
+                "Queue",
+                side_effect=lambda: _PreloadedQueue([quiet, voice, quiet]),
+            ),
+            mock.patch.object(keystrel_client.sd, "InputStream", _NoopInputStream, create=True),
+            mock.patch.object(keystrel_client.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+        ):
+            audio = keystrel_client.record_until_silence(args)
+
+        self.assertEqual(audio.shape, (4800, 1))
+        self.assertTrue(np.allclose(audio[0:1600], quiet))
+        self.assertTrue(np.allclose(audio[1600:3200], voice))
 
 
 class ClientChimeSelectionTests(unittest.TestCase):

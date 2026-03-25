@@ -104,7 +104,7 @@ These checks are covered by unit tests and should stay green before release.
 - Python syntax checks pass
 - local Unix-socket smoke test passes
 - remote Tailnet smoke test passes
-- docs updated (`README.md`, `docs/CHEATSHEET.md`, `docs/TESTING.md`, `docs/AGENTS.md` as needed)
+- docs updated (`README.md`, `docs/README.md`, `docs/OPERATING_GUIDE.md`, `docs/CONFIGURATION.md`, `docs/TROUBLESHOOTING.md`, plus references like `docs/CHEATSHEET.md` and `docs/TESTING.md`)
 - no real secrets committed (`KEYSTREL_SERVER_TOKEN` must remain placeholder in repo files)
 
 ## 6) Desktop/Audio Manual Test Strategies
