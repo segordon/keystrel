@@ -234,6 +234,65 @@ printf '%s' "${KEYSTREL_CLIENT_TEXT:-hello world}"
             self.assertEqual(len(xdotool_lines), 0)
         self.assertFalse(self._cancel_flag_path().exists())
 
+    def test_repeat_like_overlap_is_ignored_then_manual_press_cancels(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_CANCEL_DEBOUNCE_MS": "80",
+                "KEYSTREL_PTT_REPEAT_DELAY_MS": "120",
+                "KEYSTREL_PTT_REPEAT_INTERVAL_MS": "30",
+                "KEYSTREL_CLIENT_CANCEL_WATCH_MS": "1200",
+                "KEYSTREL_CLIENT_TEXT": "should not type",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.14)
+        repeat_like = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        time.sleep(0.20)
+        manual_press = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(
+            repeat_like.returncode,
+            0,
+            msg=f"stdout={repeat_like.stdout} stderr={repeat_like.stderr}",
+        )
+        self.assertEqual(
+            manual_press.returncode,
+            0,
+            msg=f"stdout={manual_press.stdout} stderr={manual_press.stderr}",
+        )
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        if self.xdotool_log.exists():
+            xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(xdotool_lines), 0)
+        self.assertFalse(self._cancel_flag_path().exists())
+
     def test_second_press_ignored_when_cancel_disabled(self):
         env = dict(self.base_env)
         env.update(

@@ -6,6 +6,7 @@ mkdir -p "$state_dir"
 lock_file="$state_dir/keystrel-ptt.lock"
 stamp_file="$state_dir/keystrel-ptt.last"
 cancel_file="$state_dir/keystrel-ptt.cancel"
+repeat_file="$state_dir/keystrel-ptt.repeat"
 
 debounce_ms="${KEYSTREL_PTT_DEBOUNCE_MS:-${STT_PTT_DEBOUNCE_MS:-180}}"
 ptt_double_press_cancel="${KEYSTREL_PTT_DOUBLE_PRESS_CANCEL:-${STT_PTT_DOUBLE_PRESS_CANCEL:-1}}"
@@ -28,10 +29,23 @@ ptt_chime_volume="${KEYSTREL_PTT_CHIME_VOLUME:-${STT_PTT_CHIME_VOLUME:-1.0}}"
 ptt_chime_cooldown_ms="${KEYSTREL_PTT_CHIME_COOLDOWN_MS:-${STT_PTT_CHIME_COOLDOWN_MS:-0}}"
 ptt_mute_start_delay_ms="${KEYSTREL_PTT_MUTE_START_DELAY_MS:-${STT_PTT_MUTE_START_DELAY_MS:-}}"
 ptt_debug_log="${KEYSTREL_PTT_DEBUG_LOG:-${STT_PTT_DEBUG_LOG:-}}"
+ptt_repeat_delay_ms="${KEYSTREL_PTT_REPEAT_DELAY_MS:-${STT_PTT_REPEAT_DELAY_MS:-}}"
+ptt_repeat_interval_ms="${KEYSTREL_PTT_REPEAT_INTERVAL_MS:-${STT_PTT_REPEAT_INTERVAL_MS:-}}"
 
 log_debug() {
   [[ -n "$ptt_debug_log" ]] || return 0
   printf '%s %s\n' "$(date +'%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$ptt_debug_log" 2>/dev/null || true
+}
+
+read_gsettings_uint() {
+  local schema="$1"
+  local key="$2"
+  local raw
+
+  command -v gsettings >/dev/null 2>&1 || return 1
+  raw="$(gsettings get "$schema" "$key" 2>/dev/null || true)"
+  [[ "$raw" =~ ([0-9]+) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
 }
 
 normalize_settings() {
@@ -72,6 +86,23 @@ normalize_settings() {
 
   if [[ -z "$ptt_mute_start_delay_ms" ]]; then
     ptt_mute_start_delay_ms=0
+  fi
+
+  if [[ -z "$ptt_repeat_delay_ms" ]]; then
+    ptt_repeat_delay_ms="$(read_gsettings_uint org.gnome.desktop.peripherals.keyboard delay || true)"
+  fi
+  if [[ -z "$ptt_repeat_interval_ms" ]]; then
+    ptt_repeat_interval_ms="$(read_gsettings_uint org.gnome.desktop.peripherals.keyboard repeat-interval || true)"
+  fi
+
+  if ! [[ "$ptt_repeat_delay_ms" =~ ^[0-9]+$ ]]; then
+    ptt_repeat_delay_ms=500
+  fi
+  if ! [[ "$ptt_repeat_interval_ms" =~ ^[0-9]+$ ]]; then
+    ptt_repeat_interval_ms=30
+  fi
+  if (( ptt_repeat_interval_ms <= 0 )); then
+    ptt_repeat_interval_ms=30
   fi
 }
 
@@ -208,6 +239,52 @@ cleanup_cancel_file() {
   rm -f "$cancel_file" >/dev/null 2>&1 || true
 }
 
+cleanup_repeat_file() {
+  rm -f "$repeat_file" >/dev/null 2>&1 || true
+}
+
+is_probable_key_repeat_press() {
+  local now_ms="$1"
+  local running_ms="$2"
+  local elapsed_ms
+  local repeat_window_ms
+  local repeat_lower_ms
+  local repeat_upper_ms
+  local last_repeat_ms=""
+
+  [[ "$running_ms" =~ ^[0-9]+$ ]] || return 1
+  elapsed_ms=$((now_ms - running_ms))
+  if (( elapsed_ms < 0 )); then
+    return 1
+  fi
+
+  repeat_window_ms=$((ptt_repeat_interval_ms * 2))
+  if (( repeat_window_ms < 40 )); then
+    repeat_window_ms=40
+  fi
+
+  if [[ -f "$repeat_file" ]]; then
+    last_repeat_ms="$(<"$repeat_file")"
+  fi
+  if [[ "$last_repeat_ms" =~ ^[0-9]+$ ]] && (( now_ms - last_repeat_ms <= repeat_window_ms )); then
+    printf '%s' "$now_ms" >"$repeat_file"
+    return 0
+  fi
+
+  repeat_lower_ms=$((ptt_repeat_delay_ms - repeat_window_ms))
+  if (( repeat_lower_ms < 0 )); then
+    repeat_lower_ms=0
+  fi
+  repeat_upper_ms=$((ptt_repeat_delay_ms + repeat_window_ms))
+
+  if (( elapsed_ms >= repeat_lower_ms && elapsed_ms <= repeat_upper_ms )); then
+    printf '%s' "$now_ms" >"$repeat_file"
+    return 0
+  fi
+
+  return 1
+}
+
 handle_running_capture_press() {
   if [[ "$ptt_double_press_cancel" != "1" ]]; then
     exit 0
@@ -224,8 +301,14 @@ handle_running_capture_press() {
     exit 0
   fi
 
+  if is_probable_key_repeat_press "$now_ms" "$running_ms"; then
+    log_debug "cancel ignored probable key-repeat elapsed_ms=$((now_ms - running_ms)) repeat_delay_ms=${ptt_repeat_delay_ms} repeat_interval_ms=${ptt_repeat_interval_ms}"
+    exit 0
+  fi
+
   printf '%s' "$now_ms" >"$cancel_file"
   printf '%s' "$now_ms" >"$stamp_file"
+  cleanup_repeat_file
   log_debug "cancel requested"
   exit 0
 }
@@ -265,6 +348,7 @@ main() {
 
   printf '%s' "$now_ms" >"$stamp_file"
   cleanup_cancel_file
+  cleanup_repeat_file
 
   play_ptt_chime
 
@@ -291,6 +375,7 @@ main() {
   fi
 
   cleanup_cancel_file
+  cleanup_repeat_file
 }
 
 main "$@"
