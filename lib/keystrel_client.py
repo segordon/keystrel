@@ -116,6 +116,19 @@ def parse_env_choice(name, default, choices):
     return default
 
 
+def normalize_audio_device(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+        return text
+    return value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record microphone audio and request transcription from keystrel-daemon"
@@ -237,6 +250,12 @@ def parse_args():
         type=int,
         default=parse_env_int("KEYSTREL_MUTE_START_DELAY_MS", 0),
         help="delay muting output sinks after capture starts",
+    )
+    parser.add_argument(
+        "--mute-settle-ms",
+        type=int,
+        default=parse_env_int("KEYSTREL_MUTE_SETTLE_MS", 300),
+        help="max wait to confirm output mute before opening microphone stream",
     )
     parser.add_argument(
         "--webrtcvad",
@@ -364,6 +383,7 @@ def parse_args():
     args.block_seconds = max(0.01, args.block_seconds)
     args.threshold = max(0.0, args.threshold)
     args.mute_start_delay_ms = max(0, args.mute_start_delay_ms)
+    args.mute_settle_ms = max(0, args.mute_settle_ms)
     args.speech_ratio = max(0.0, min(1.0, args.speech_ratio))
     args.start_speech_chunks = max(1, args.start_speech_chunks)
     args.pre_roll_seconds = max(0.0, args.pre_roll_seconds)
@@ -372,6 +392,7 @@ def parse_args():
     args.server_timeout = max(0.1, args.server_timeout)
     args.server = args.server.strip()
     args.server_token = args.server_token.strip()
+    args.device = normalize_audio_device(args.device)
     args.chime_freq_hz = max(100.0, min(4000.0, args.chime_freq_hz))
     args.chime_duration_ms = max(20, args.chime_duration_ms)
     args.chime_volume = max(0.0, min(1.0, args.chime_volume))
@@ -533,6 +554,51 @@ def restore_output_mute(args, sink_states):
         )
 
 
+def confirm_output_mute_before_capture(args, sink_states):
+    if args.mute_settle_ms <= 0 or not sink_states:
+        return
+
+    pending = {sink for sink, was_muted in sink_states.items() if not was_muted}
+    if not pending:
+        return
+
+    timeout_s = args.mute_settle_ms / 1000.0
+    deadline = time.monotonic() + timeout_s
+
+    if args.verbose:
+        print(
+            f"[keystrel-client] confirming mute on {len(pending)} sink(s) "
+            f"for up to {args.mute_settle_ms}ms before mic start",
+            file=sys.stderr,
+        )
+
+    while pending:
+        still_pending = set()
+        for sink in pending:
+            try:
+                if not get_sink_mute_state(sink):
+                    still_pending.add(sink)
+            except Exception:  # noqa: BLE001
+                still_pending.add(sink)
+        pending = still_pending
+
+        if not pending:
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.02, remaining))
+
+    if args.verbose:
+        pending_sinks = ", ".join(sorted(pending))
+        print(
+            "[keystrel-client] mute confirmation timed out; "
+            f"starting mic with unconfirmed sink(s): {pending_sinks}",
+            file=sys.stderr,
+        )
+
+
 def acquire_client_lock(args):
     lock_path = Path(
         get_env("KEYSTREL_CLIENT_LOCK", "~/.cache/keystrel/keystrel-client.lock")
@@ -552,6 +618,7 @@ def acquire_client_lock(args):
 def build_webrtc_vad(args):
     if not args.webrtcvad:
         return None
+
     if webrtcvad is None:
         if args.verbose:
             print("[keystrel-client] WebRTC VAD unavailable, using RMS fallback", file=sys.stderr)
@@ -579,6 +646,78 @@ def build_webrtc_vad(args):
         if args.verbose:
             print(f"[keystrel-client] failed to initialize WebRTC VAD: {exc}", file=sys.stderr)
         return None
+
+
+def auto_select_input_device(args):
+    if args.device is not None:
+        return args.device, False
+
+    try:
+        devices = sd.query_devices()
+        default_pair = sd.default.device
+        default_input_index = int(default_pair[0])
+    except Exception:  # noqa: BLE001
+        return None, False
+
+    if default_input_index < 0 or default_input_index >= len(devices):
+        return None, False
+
+    default_info = devices[default_input_index]
+    default_name = str(default_info.get("name", "")).strip().lower()
+    default_inputs = int(default_info.get("max_input_channels", 0) or 0)
+
+    default_looks_virtual = default_name in {"default", "pipewire"} or default_inputs >= 16
+    if not default_looks_virtual:
+        return None, False
+
+    candidates = []
+    for index, info in enumerate(devices):
+        name = str(info.get("name", "")).strip()
+        lowered = name.lower()
+        inputs = int(info.get("max_input_channels", 0) or 0)
+        outputs = int(info.get("max_output_channels", 0) or 0)
+
+        if inputs <= 0:
+            continue
+        if outputs != 0:
+            continue
+        if lowered in {"default", "pipewire"}:
+            continue
+        if "monitor" in lowered:
+            continue
+
+        try:
+            sd.check_input_settings(
+                device=index,
+                channels=args.channels,
+                samplerate=args.sample_rate,
+                dtype="float32",
+            )
+        except Exception:  # noqa: BLE001
+            continue
+
+        score = 0
+        if "usb" in lowered:
+            score += 3
+        if "mic" in lowered or "microphone" in lowered:
+            score += 3
+        if "mono" in lowered:
+            score += 1
+        candidates.append((score, -index, index, name))
+
+    if not candidates:
+        return None, False
+
+    candidates.sort(reverse=True)
+    _, _, selected_index, selected_name = candidates[0]
+
+    if args.verbose:
+        print(
+            "[keystrel-client] default input appears virtual; "
+            f"auto-selecting capture device {selected_index}: {selected_name}",
+            file=sys.stderr,
+        )
+    return selected_index, True
 
 
 def speech_ratio_in_chunk(chunk, args, vad):
@@ -642,8 +781,9 @@ def record_until_silence(args, on_tick=None):
         "blocksize": blocksize,
         "callback": callback,
     }
-    if args.device is not None:
-        stream_kwargs["device"] = args.device
+    capture_device, _ = auto_select_input_device(args)
+    if capture_device is not None:
+        stream_kwargs["device"] = capture_device
 
     if args.verbose:
         print(
@@ -1033,6 +1173,7 @@ def main():
             if args.mute_output and mute_start_delay_s <= 0:
                 sink_states = mute_output_during_capture(args)
                 mute_applied = True
+                confirm_output_mute_before_capture(args, sink_states)
             audio = record_until_silence(args, on_tick=maybe_apply_mute)
         except Exception as exc:  # noqa: BLE001
             print(f"[keystrel-client] microphone capture failed: {exc}", file=sys.stderr)

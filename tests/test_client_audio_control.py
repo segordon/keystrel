@@ -17,6 +17,9 @@ def _args(**overrides):
         "start_chime": True,
         "chime_backend": "auto",
         "chime_cooldown_ms": 0,
+        "device": None,
+        "channels": 1,
+        "sample_rate": 16000,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -74,6 +77,114 @@ class ClientMuteControlTests(unittest.TestCase):
         self.assertEqual(set_mute.call_count, 2)
         set_mute.assert_any_call("1", False)
         set_mute.assert_any_call("2", True)
+
+
+class ClientMuteConfirmationTests(unittest.TestCase):
+    def test_confirm_output_mute_returns_when_all_sinks_muted(self):
+        args = _args(mute_settle_ms=300)
+        with (
+            mock.patch.object(
+                keystrel_client,
+                "get_sink_mute_state",
+                side_effect=[False, True, True],
+            ) as get_mute,
+            mock.patch.object(keystrel_client.time, "sleep") as sleep,
+            mock.patch.object(keystrel_client.time, "monotonic", side_effect=[0.0, 0.05, 0.10]),
+        ):
+            keystrel_client.confirm_output_mute_before_capture(args, {"1": False, "2": True})
+
+        self.assertEqual(get_mute.call_count, 2)
+        sleep.assert_called_once_with(0.02)
+
+    def test_confirm_output_mute_times_out(self):
+        args = _args(mute_settle_ms=40, verbose=True)
+        with (
+            mock.patch.object(keystrel_client, "get_sink_mute_state", return_value=False) as get_mute,
+            mock.patch.object(keystrel_client.time, "sleep") as sleep,
+            mock.patch.object(keystrel_client.time, "monotonic", side_effect=[0.0, 0.01, 0.03, 0.05]),
+        ):
+            keystrel_client.confirm_output_mute_before_capture(args, {"1": False})
+
+        self.assertEqual(get_mute.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertAlmostEqual(sleep.call_args_list[0].args[0], 0.02)
+        self.assertAlmostEqual(sleep.call_args_list[1].args[0], 0.01)
+
+
+class ClientInputDeviceSelectionTests(unittest.TestCase):
+    def test_auto_select_keeps_explicit_device(self):
+        args = _args(device="UM10")
+        selected, auto_selected = keystrel_client.auto_select_input_device(args)
+        self.assertEqual(selected, "UM10")
+        self.assertFalse(auto_selected)
+
+    def test_auto_select_uses_input_only_when_default_virtual(self):
+        args = _args(verbose=True, device=None)
+        devices = [
+            {"name": "hdmi", "max_input_channels": 0, "max_output_channels": 2},
+            {"name": "UM10: USB Audio", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "default", "max_input_channels": 64, "max_output_channels": 64},
+        ]
+        with (
+            mock.patch.object(keystrel_client.sd, "query_devices", return_value=devices, create=True),
+            mock.patch.object(
+                keystrel_client.sd,
+                "default",
+                SimpleNamespace(device=[2, 2]),
+                create=True,
+            ),
+            mock.patch.object(keystrel_client.sd, "check_input_settings", return_value=None, create=True),
+        ):
+            selected, auto_selected = keystrel_client.auto_select_input_device(args)
+
+        self.assertEqual(selected, 1)
+        self.assertTrue(auto_selected)
+
+    def test_auto_select_skips_when_default_is_dedicated_input(self):
+        args = _args(device=None)
+        devices = [
+            {"name": "UM10: USB Audio", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "default", "max_input_channels": 64, "max_output_channels": 64},
+        ]
+        with (
+            mock.patch.object(keystrel_client.sd, "query_devices", return_value=devices, create=True),
+            mock.patch.object(
+                keystrel_client.sd,
+                "default",
+                SimpleNamespace(device=[0, 0]),
+                create=True,
+            ),
+        ):
+            selected, auto_selected = keystrel_client.auto_select_input_device(args)
+
+        self.assertIsNone(selected)
+        self.assertFalse(auto_selected)
+
+    def test_auto_select_skips_candidate_with_unsupported_sample_rate(self):
+        args = _args(device=None)
+        devices = [
+            {"name": "UM10: USB Audio", "max_input_channels": 1, "max_output_channels": 0},
+            {"name": "default", "max_input_channels": 64, "max_output_channels": 64},
+        ]
+        with (
+            mock.patch.object(keystrel_client.sd, "query_devices", return_value=devices, create=True),
+            mock.patch.object(
+                keystrel_client.sd,
+                "default",
+                SimpleNamespace(device=[1, 1]),
+                create=True,
+            ),
+            mock.patch.object(
+                keystrel_client.sd,
+                "check_input_settings",
+                side_effect=RuntimeError("unsupported"),
+                create=True,
+            ),
+        ):
+            selected, auto_selected = keystrel_client.auto_select_input_device(args)
+
+        self.assertIsNone(selected)
+        self.assertFalse(auto_selected)
 
 
 class ClientChimeSelectionTests(unittest.TestCase):

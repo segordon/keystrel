@@ -25,6 +25,7 @@ def _base_args(**overrides):
         "server_token": "",
         "mute_output": False,
         "mute_start_delay_ms": 0,
+        "mute_settle_ms": 0,
         "socket_timeout": 1.0,
         "server_timeout": 1.0,
         "language": "",
@@ -154,6 +155,24 @@ class ClientMainFlowTests(unittest.TestCase):
 
         self.assertEqual(stdout.getvalue(), "")
         send_unix.assert_not_called()
+
+    def test_mute_confirmation_runs_before_capture(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            socket_path = Path(tmp_dir) / "daemon.sock"
+            socket_path.write_text("present", encoding="utf-8")
+            args = _base_args(socket=str(socket_path), mute_output=True, mute_settle_ms=180)
+
+            with (
+                mock.patch.object(keystrel_client, "parse_args", return_value=args),
+                mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+                mock.patch.object(keystrel_client, "play_start_chime"),
+                mock.patch.object(keystrel_client, "mute_output_during_capture", return_value={"1": False}),
+                mock.patch.object(keystrel_client, "confirm_output_mute_before_capture") as confirm_mute,
+                mock.patch.object(keystrel_client, "record_until_silence", return_value=_FakeAudio(0)),
+            ):
+                keystrel_client.main()
+
+        confirm_mute.assert_called_once_with(args, {"1": False})
 
 
 if __name__ == "__main__":

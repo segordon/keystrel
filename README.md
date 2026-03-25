@@ -14,7 +14,6 @@ This project provides local speech-to-text for Linux X11 workflows, with push-to
 For deep implementation history and agent handoff context, read `docs/AGENTS.md`.
 For command-only reference, use `docs/CHEATSHEET.md`.
 For repeatable verification and smoke checks, use `docs/TESTING.md`.
-For rename details and upgrade steps, use `docs/MIGRATION.md`.
 
 ## What You Get
 
@@ -31,12 +30,6 @@ For rename details and upgrade steps, use `docs/MIGRATION.md`.
 - Desktop/session requirement: X11 (for `xdotool` typing injection).
 - Backend model defaults: English-focused `large-v3` with stronger decoding search.
 - Keybinding example: `Ctrl+grave` runs `$HOME/.local/bin/keystrel-ptt`.
-
-## Naming Migration
-
-- Primary commands are now `keystrel-daemon`, `keystrel-client`, and `keystrel-ptt`.
-- Preferred environment variable prefix is `KEYSTREL_`.
-- Legacy `STT_` environment variables are still accepted for backward compatibility and now emit a one-time deprecation warning.
 
 ## High-Level Architecture
 
@@ -357,6 +350,7 @@ systemctl --user restart keystrel-daemon
 - `--server-token` (shared token for remote TCP mode)
 - `--server-timeout` (bounds remote connect/read wait time)
 - `--mute-start-delay-ms` (delay output muting after capture starts)
+- `--mute-settle-ms` (max wait to confirm mute before microphone stream opens)
 - `--start-chime` / `--no-start-chime`
 - `--chime-backend {auto,pipewire,paplay,canberra,sounddevice}`
 - `--chime-file` (audio file for paplay/canberra backends)
@@ -376,6 +370,7 @@ systemctl --user restart keystrel-daemon
 - `KEYSTREL_SERVER_TOKEN` (shared token for remote mode)
 - `KEYSTREL_SERVER_TIMEOUT` (remote connect/read timeout)
 - `KEYSTREL_MUTE_START_DELAY_MS` (delay mute start; useful for Bluetooth chime audibility)
+- `KEYSTREL_MUTE_SETTLE_MS` (max mute-confirm window before mic starts)
 - `KEYSTREL_START_CHIME` (`1`/`0`)
 - `KEYSTREL_CHIME_BACKEND` (`auto`, `pipewire`, `paplay`, `canberra`, `sounddevice`)
 - `KEYSTREL_CHIME_FILE` (default `/usr/share/sounds/freedesktop/stereo/bell.oga`)
@@ -427,8 +422,10 @@ keystrel-client --silence-seconds 1.2
 
 ```bash
 keystrel-client --list-devices
-keystrel-client --device 6 --verbose
+keystrel-client --device <device-id-or-name> --sample-rate 48000 --verbose
 ```
+
+Prefer an input-only microphone device when available (for example a USB mic with `1 in, 0 out`) to avoid mixing with virtual monitor channels.
 
 ### Disable mute for one run
 
