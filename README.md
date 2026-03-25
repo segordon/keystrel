@@ -50,7 +50,6 @@ For complete setup, service operations, and remote/Tailscale flow, use the docs 
 - [Troubleshooting](docs/TROUBLESHOOTING.md) - common failures and recovery commands
 - [Cheat Sheet](docs/CHEATSHEET.md) - quick command reference
 - [Testing Guide](docs/TESTING.md) - regression and smoke-test workflows
-- [Migration Guide](docs/MIGRATION.md) - legacy `stt-*` to `keystrel-*` transition notes
 
 ## Repository Layout
 

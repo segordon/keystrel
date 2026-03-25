@@ -13,7 +13,6 @@ Use this folder for detailed docs that do not belong on the GitHub front page.
 - [Cheat Sheet](CHEATSHEET.md) - compact daily command reference
 - [Testing Guide](TESTING.md) - local regression checks and manual smoke test plans
 
-## Supplemental
+## Internal
 
-- [Migration Guide](MIGRATION.md) - rename/migration map from `stt-*` to `keystrel-*`
 - [Agent Notes](AGENTS.md) - internal project handoff and agent workflow context
