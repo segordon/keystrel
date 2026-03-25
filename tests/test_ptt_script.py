@@ -40,12 +40,25 @@ printf '%s\n' "$*" >>"${XDOTOOL_LOG:?}"
 set -euo pipefail
 printf 'call\n' >>"${KEYSTREL_CLIENT_CALL_LOG:?}"
 if [[ -n "${KEYSTREL_CLIENT_ENV_LOG:-}" ]]; then
-  printf 'mute_start_delay=%s input_device=%s sample_rate=%s mute_settle=%s start_chime=%s\n' \
+  printf 'mute_start_delay=%s input_device=%s sample_rate=%s mute_settle=%s start_chime=%s cancel_file=%s\n' \
     "${KEYSTREL_MUTE_START_DELAY_MS:-}" \
     "${KEYSTREL_INPUT_DEVICE:-}" \
     "${KEYSTREL_SAMPLE_RATE:-}" \
     "${KEYSTREL_MUTE_SETTLE_MS:-}" \
-    "${KEYSTREL_START_CHIME:-}" >>"${KEYSTREL_CLIENT_ENV_LOG}"
+    "${KEYSTREL_START_CHIME:-}" \
+    "${KEYSTREL_CANCEL_FILE:-}" >>"${KEYSTREL_CLIENT_ENV_LOG}"
+fi
+if [[ "${KEYSTREL_CLIENT_CANCEL_WATCH_MS:-}" =~ ^[0-9]+$ ]]; then
+  deadline_ms=$(( $(date +%s%3N) + KEYSTREL_CLIENT_CANCEL_WATCH_MS ))
+  while (( $(date +%s%3N) < deadline_ms )); do
+    if [[ -n "${KEYSTREL_CANCEL_FILE:-}" && -f "${KEYSTREL_CANCEL_FILE}" ]]; then
+      exit 0
+    fi
+    sleep 0.01
+  done
+fi
+if [[ -n "${KEYSTREL_CANCEL_FILE:-}" && -f "${KEYSTREL_CANCEL_FILE}" ]]; then
+  exit 0
 fi
 if [[ -n "${KEYSTREL_CLIENT_SLEEP_MS:-}" ]]; then
   s=$((KEYSTREL_CLIENT_SLEEP_MS / 1000))
@@ -118,6 +131,7 @@ printf '%s' "${KEYSTREL_CLIENT_TEXT:-hello world}"
         self.assertIn("sample_rate=48000", env_line)
         self.assertIn("mute_settle=350", env_line)
         self.assertIn("start_chime=0", env_line)
+        self.assertIn("cancel_file=", env_line)
 
     def test_invalid_ptt_mute_delay_falls_back_to_zero(self):
         result = self._run_ptt(
@@ -161,6 +175,194 @@ printf '%s' "${KEYSTREL_CLIENT_TEXT:-hello world}"
         client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(xdotool_lines), 1)
         self.assertEqual(len(client_lines), 1)
+
+    def test_second_press_requests_cancel_and_skips_typing(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_CANCEL_DEBOUNCE_MS": "80",
+                "KEYSTREL_CLIENT_CANCEL_WATCH_MS": "900",
+                "KEYSTREL_CLIENT_TEXT": "should not type",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.12)
+        second = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(second.returncode, 0, msg=f"stdout={second.stdout} stderr={second.stderr}")
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        if self.xdotool_log.exists():
+            xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(xdotool_lines), 0)
+
+    def test_second_press_ignored_when_cancel_disabled(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_DOUBLE_PRESS_CANCEL": "0",
+                "KEYSTREL_CLIENT_SLEEP_MS": "400",
+                "KEYSTREL_CLIENT_TEXT": "typed",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.10)
+        second = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(second.returncode, 0, msg=f"stdout={second.stdout} stderr={second.stderr}")
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        self.assertEqual(len(xdotool_lines), 1)
+
+    def test_invalid_cancel_toggle_value_falls_back_to_enabled(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_DOUBLE_PRESS_CANCEL": "bad-value",
+                "KEYSTREL_PTT_CANCEL_DEBOUNCE_MS": "80",
+                "KEYSTREL_CLIENT_CANCEL_WATCH_MS": "900",
+                "KEYSTREL_CLIENT_TEXT": "should not type",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.12)
+        second = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(second.returncode, 0, msg=f"stdout={second.stdout} stderr={second.stderr}")
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        if self.xdotool_log.exists():
+            xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(xdotool_lines), 0)
+
+    def test_invalid_cancel_debounce_falls_back_to_default(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_CANCEL_DEBOUNCE_MS": "not-a-number",
+                "KEYSTREL_CLIENT_CANCEL_WATCH_MS": "250",
+                "KEYSTREL_CLIENT_TEXT": "typed",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.10)
+        second = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(second.returncode, 0, msg=f"stdout={second.stdout} stderr={second.stderr}")
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        self.assertEqual(len(xdotool_lines), 1)
+
+    def test_cancel_debounce_ignores_immediate_repeat(self):
+        env = dict(self.base_env)
+        env.update(
+            {
+                "KEYSTREL_PTT_DEBOUNCE_MS": "0",
+                "KEYSTREL_PTT_CANCEL_DEBOUNCE_MS": "500",
+                "KEYSTREL_CLIENT_CANCEL_WATCH_MS": "250",
+                "KEYSTREL_CLIENT_TEXT": "typed",
+            }
+        )
+
+        first = subprocess.Popen(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.05)
+        second = subprocess.run(
+            ["bash", str(PTT_SCRIPT)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        first_stdout, first_stderr = first.communicate(timeout=5.0)
+
+        self.assertEqual(first.returncode, 0, msg=f"stdout={first_stdout} stderr={first_stderr}")
+        self.assertEqual(second.returncode, 0, msg=f"stdout={second.stdout} stderr={second.stderr}")
+
+        client_lines = self.client_log.read_text(encoding="utf-8").splitlines()
+        xdotool_lines = self.xdotool_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(client_lines), 1)
+        self.assertEqual(len(xdotool_lines), 1)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -155,6 +156,18 @@ class ClientMuteConfirmationTests(unittest.TestCase):
         self.assertAlmostEqual(sleep.call_args_list[0].args[0], 0.02)
         self.assertAlmostEqual(sleep.call_args_list[1].args[0], 0.01)
 
+    def test_confirm_output_mute_can_be_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cancel_file = Path(tmp_dir) / "cancel.flag"
+            cancel_file.write_text("1", encoding="utf-8")
+            args = _args(mute_settle_ms=300, cancel_file=str(cancel_file))
+
+            with mock.patch.object(keystrel_client, "get_sink_mute_state") as get_mute:
+                with self.assertRaises(keystrel_client.CaptureCancelled):
+                    keystrel_client.confirm_output_mute_before_capture(args, {"1": False})
+
+        get_mute.assert_not_called()
+
 
 class ClientInputDeviceSelectionTests(unittest.TestCase):
     def test_auto_select_keeps_explicit_device(self):
@@ -307,6 +320,27 @@ class ClientRecordUntilSilenceTests(unittest.TestCase):
         self.assertEqual(audio.shape, (4800, 1))
         self.assertTrue(np.allclose(audio[0:1600], quiet))
         self.assertTrue(np.allclose(audio[1600:3200], voice))
+
+    def test_record_until_silence_raises_on_cancel_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cancel_file = Path(tmp_dir) / "cancel.flag"
+            cancel_file.write_text("1", encoding="utf-8")
+            args = _record_args(cancel_file=str(cancel_file))
+
+            monotonic_values = iter([0.0, 0.01])
+
+            with (
+                mock.patch.object(keystrel_client, "build_webrtc_vad", return_value=None),
+                mock.patch.object(
+                    keystrel_client.queue,
+                    "Queue",
+                    side_effect=lambda: _PreloadedQueue([]),
+                ),
+                mock.patch.object(keystrel_client.sd, "InputStream", _NoopInputStream, create=True),
+                mock.patch.object(keystrel_client.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+            ):
+                with self.assertRaises(keystrel_client.CaptureCancelled):
+                    keystrel_client.record_until_silence(args)
 
 
 class ClientChimeSelectionTests(unittest.TestCase):

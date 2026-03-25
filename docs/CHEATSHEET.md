@@ -122,10 +122,20 @@ Run PTT script manually:
 keystrel-ptt
 ```
 
+Cancel active capture early:
+
+- Press the same PTT hotkey again while capture is active.
+
 Auto-press Enter after typing:
 
 ```bash
 KEYSTREL_PTT_SEND_ENTER=1 keystrel-ptt
+```
+
+Tune repeat/cancel debounce behavior:
+
+```bash
+KEYSTREL_PTT_DEBOUNCE_MS=180 KEYSTREL_PTT_CANCEL_DEBOUNCE_MS=350 keystrel-ptt
 ```
 
 Disable chime for one run:

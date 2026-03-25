@@ -1,7 +1,7 @@
 # Keystrel
 
 <p align="center">
-  <img src="docs/keystrel_logo.jpg" alt="Keystrel mascot logo" width="220" />
+  <img src="docs/keystrel_logo.png" alt="Keystrel mascot logo" width="220" />
 </p>
 
 <p align="center">
@@ -58,3 +58,7 @@ For complete setup, service operations, and remote/Tailscale flow, use the docs 
 - `config/` - daemon env template
 - `docs/` - detailed project documentation
 - `tests/` - local unit and behavior tests
+
+## License
+
+Keystrel is licensed under the Apache License 2.0. See `LICENSE` and `NOTICE`.

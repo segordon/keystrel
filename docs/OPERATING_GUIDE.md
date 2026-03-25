@@ -236,6 +236,8 @@ When enabled, client logic:
   - lock: `${XDG_RUNTIME_DIR:-$HOME/.cache/keystrel}/keystrel-ptt.lock`
   - debounce stamp: `${XDG_RUNTIME_DIR:-$HOME/.cache/keystrel}/keystrel-ptt.last`
   - prevents key-repeat fan-out.
+  - second press while active requests cancel by default.
+  - cancel request path uses a debounce window to ignore repeat-key noise.
 
 ## Global Hotkey Notes
 

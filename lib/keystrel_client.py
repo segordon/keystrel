@@ -30,6 +30,10 @@ WEBRTCVAD_SAMPLE_RATES = {8000, 16000, 32000, 48000}
 WEBRTCVAD_FRAME_MS = {10, 20, 30}
 
 
+class CaptureCancelled(Exception):
+    pass
+
+
 def parse_bool(value):
     if isinstance(value, bool):
         return value
@@ -258,6 +262,11 @@ def parse_args():
         help="max wait to confirm output mute before opening microphone stream",
     )
     parser.add_argument(
+        "--cancel-file",
+        default=get_env("KEYSTREL_CANCEL_FILE", ""),
+        help="optional path used to cancel active capture",
+    )
+    parser.add_argument(
         "--webrtcvad",
         action=argparse.BooleanOptionalAction,
         default=parse_env_bool("KEYSTREL_WEBRTCVAD", True),
@@ -392,6 +401,7 @@ def parse_args():
     args.server_timeout = max(0.1, args.server_timeout)
     args.server = args.server.strip()
     args.server_token = args.server_token.strip()
+    args.cancel_file = str(Path(args.cancel_file).expanduser()).strip() if args.cancel_file else ""
     args.device = normalize_audio_device(args.device)
     args.chime_freq_hz = max(100.0, min(4000.0, args.chime_freq_hz))
     args.chime_duration_ms = max(20, args.chime_duration_ms)
@@ -554,6 +564,16 @@ def restore_output_mute(args, sink_states):
         )
 
 
+def cancel_requested(args):
+    cancel_file = str(getattr(args, "cancel_file", "") or "").strip()
+    if not cancel_file:
+        return False
+    try:
+        return Path(cancel_file).exists()
+    except OSError:
+        return False
+
+
 def confirm_output_mute_before_capture(args, sink_states):
     if args.mute_settle_ms <= 0 or not sink_states:
         return
@@ -573,6 +593,9 @@ def confirm_output_mute_before_capture(args, sink_states):
         )
 
     while pending:
+        if cancel_requested(args):
+            raise CaptureCancelled()
+
         still_pending = set()
         for sink in pending:
             try:
@@ -798,11 +821,16 @@ def record_until_silence(args, on_tick=None):
 
     with sd.InputStream(**stream_kwargs):
         while True:
+            if cancel_requested(args):
+                raise CaptureCancelled()
+
             now = time.monotonic()
             elapsed = now - started_at
             if on_tick is not None:
                 try:
                     on_tick(elapsed)
+                except CaptureCancelled:
+                    raise
                 except Exception:  # noqa: BLE001
                     pass
             if elapsed >= args.max_seconds:
@@ -1164,6 +1192,8 @@ def main():
 
         def maybe_apply_mute(elapsed_s):
             nonlocal sink_states, mute_applied
+            if cancel_requested(args):
+                raise CaptureCancelled()
             if mute_applied or not args.mute_output:
                 return
             if elapsed_s < mute_start_delay_s:
@@ -1173,18 +1203,30 @@ def main():
 
         try:
             play_start_chime(args)
+            if cancel_requested(args):
+                raise CaptureCancelled()
             if args.mute_output and mute_start_delay_s <= 0:
                 sink_states = mute_output_during_capture(args)
                 mute_applied = True
                 confirm_output_mute_before_capture(args, sink_states)
             audio = record_until_silence(args, on_tick=maybe_apply_mute)
+        except CaptureCancelled:
+            if args.verbose:
+                print("[keystrel-client] capture cancelled", file=sys.stderr)
+            audio = None
         except Exception as exc:  # noqa: BLE001
             print(f"[keystrel-client] microphone capture failed: {exc}", file=sys.stderr)
             sys.exit(3)
         finally:
             restore_output_mute(args, sink_states)
 
-        if audio.size == 0:
+        if cancel_requested(args):
+            if args.verbose:
+                print("[keystrel-client] request skipped due cancel", file=sys.stderr)
+            print("", end="")
+            return
+
+        if audio is None or getattr(audio, "size", 0) == 0:
             print("", end="")
             return
 

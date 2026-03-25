@@ -34,7 +34,9 @@ def _base_args(**overrides):
         "best_of": None,
         "json": False,
         "sample_rate": 16000,
+        "channels": 1,
         "start_chime": False,
+        "cancel_file": "",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -202,6 +204,90 @@ class ClientMainFlowTests(unittest.TestCase):
 
         mute_now.assert_called_once_with(args)
         confirm_mute.assert_not_called()
+
+    def test_capture_cancelled_returns_empty_without_request(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            socket_path = Path(tmp_dir) / "daemon.sock"
+            socket_path.write_text("present", encoding="utf-8")
+            args = _base_args(socket=str(socket_path))
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(keystrel_client, "parse_args", return_value=args),
+                mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+                mock.patch.object(keystrel_client, "play_start_chime"),
+                mock.patch.object(
+                    keystrel_client,
+                    "record_until_silence",
+                    side_effect=keystrel_client.CaptureCancelled(),
+                ),
+                mock.patch.object(keystrel_client, "send_unix_request") as send_unix,
+                mock.patch("sys.stdout", new=stdout),
+            ):
+                keystrel_client.main()
+
+        self.assertEqual(stdout.getvalue(), "")
+        send_unix.assert_not_called()
+
+    def test_cancel_requested_after_capture_skips_request(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            socket_path = Path(tmp_dir) / "daemon.sock"
+            socket_path.write_text("present", encoding="utf-8")
+            cancel_path = Path(tmp_dir) / "cancel.flag"
+            args = _base_args(socket=str(socket_path), cancel_file=str(cancel_path))
+
+            def _record_and_cancel(_args, on_tick):  # noqa: ARG001
+                cancel_path.write_text("1", encoding="utf-8")
+                return _FakeAudio(123)
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(keystrel_client, "parse_args", return_value=args),
+                mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+                mock.patch.object(keystrel_client, "play_start_chime"),
+                mock.patch.object(keystrel_client, "record_until_silence", side_effect=_record_and_cancel),
+                mock.patch.object(keystrel_client.sf, "write", create=True) as sf_write,
+                mock.patch.object(keystrel_client, "send_unix_request") as send_unix,
+                mock.patch("sys.stdout", new=stdout),
+            ):
+                keystrel_client.main()
+
+        self.assertEqual(stdout.getvalue(), "")
+        sf_write.assert_not_called()
+        send_unix.assert_not_called()
+
+    def test_cancel_from_maybe_apply_mute_path_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            socket_path = Path(tmp_dir) / "daemon.sock"
+            socket_path.write_text("present", encoding="utf-8")
+            cancel_path = Path(tmp_dir) / "cancel.flag"
+            args = _base_args(
+                socket=str(socket_path),
+                cancel_file=str(cancel_path),
+                mute_output=True,
+                mute_start_delay_ms=120,
+            )
+
+            def _record_side_effect(_args, on_tick):
+                cancel_path.write_text("1", encoding="utf-8")
+                on_tick(0.20)
+                return _FakeAudio(999)
+
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(keystrel_client, "parse_args", return_value=args),
+                mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+                mock.patch.object(keystrel_client, "play_start_chime"),
+                mock.patch.object(keystrel_client, "mute_output_during_capture") as mute_now,
+                mock.patch.object(keystrel_client, "record_until_silence", side_effect=_record_side_effect),
+                mock.patch.object(keystrel_client, "send_unix_request") as send_unix,
+                mock.patch("sys.stdout", new=stdout),
+            ):
+                keystrel_client.main()
+
+        self.assertEqual(stdout.getvalue(), "")
+        mute_now.assert_not_called()
+        send_unix.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -5,8 +5,11 @@ state_dir="${XDG_RUNTIME_DIR:-$HOME/.cache/keystrel}"
 mkdir -p "$state_dir"
 lock_file="$state_dir/keystrel-ptt.lock"
 stamp_file="$state_dir/keystrel-ptt.last"
+cancel_file="$state_dir/keystrel-ptt.cancel"
 
-debounce_ms="${KEYSTREL_PTT_DEBOUNCE_MS:-${STT_PTT_DEBOUNCE_MS:-0}}"
+debounce_ms="${KEYSTREL_PTT_DEBOUNCE_MS:-${STT_PTT_DEBOUNCE_MS:-180}}"
+ptt_double_press_cancel="${KEYSTREL_PTT_DOUBLE_PRESS_CANCEL:-${STT_PTT_DOUBLE_PRESS_CANCEL:-1}}"
+ptt_cancel_debounce_ms="${KEYSTREL_PTT_CANCEL_DEBOUNCE_MS:-${STT_PTT_CANCEL_DEBOUNCE_MS:-350}}"
 keystrel_client_bin="${KEYSTREL_CLIENT_BIN:-${STT_CLIENT_BIN:-$HOME/.local/bin/keystrel-client}}"
 type_delay_ms="${KEYSTREL_TYPE_DELAY_MS:-${STT_TYPE_DELAY_MS:-1}}"
 
@@ -27,7 +30,15 @@ ptt_mute_start_delay_ms="${KEYSTREL_PTT_MUTE_START_DELAY_MS:-${STT_PTT_MUTE_STAR
 ptt_debug_log="${KEYSTREL_PTT_DEBUG_LOG:-${STT_PTT_DEBUG_LOG:-}}"
 
 if ! [[ "$debounce_ms" =~ ^[0-9]+$ ]]; then
-  debounce_ms=0
+  debounce_ms=180
+fi
+
+if ! [[ "$ptt_double_press_cancel" =~ ^(0|1)$ ]]; then
+  ptt_double_press_cancel=1
+fi
+
+if ! [[ "$ptt_cancel_debounce_ms" =~ ^[0-9]+$ ]]; then
+  ptt_cancel_debounce_ms=350
 fi
 
 if ! [[ "$type_delay_ms" =~ ^[0-9]+$ ]]; then
@@ -191,6 +202,24 @@ play_ptt_chime() {
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
+  if [[ "$ptt_double_press_cancel" != "1" ]]; then
+    exit 0
+  fi
+
+  now_ms="$(date +%s%3N)"
+  running_ms="0"
+  if [[ -f "$stamp_file" ]]; then
+    running_ms="$(<"$stamp_file")"
+  fi
+
+  if [[ "$running_ms" =~ ^[0-9]+$ ]] && (( now_ms - running_ms < ptt_cancel_debounce_ms )); then
+    log_debug "cancel ignored elapsed_ms=$((now_ms - running_ms)) cancel_debounce_ms=${ptt_cancel_debounce_ms}"
+    exit 0
+  fi
+
+  printf '%s' "$now_ms" >"$cancel_file"
+  printf '%s' "$now_ms" >"$stamp_file"
+  log_debug "cancel requested"
   exit 0
 fi
 
@@ -202,15 +231,23 @@ if [[ -f "$stamp_file" ]]; then
   fi
 fi
 printf '%s' "$now_ms" >"$stamp_file"
+rm -f "$cancel_file" >/dev/null 2>&1 || true
 
 play_ptt_chime
 
 log_debug "capture start mute_delay_ms=${ptt_mute_start_delay_ms}"
-text="$(KEYSTREL_START_CHIME=0 KEYSTREL_MUTE_START_DELAY_MS="$ptt_mute_start_delay_ms" "$keystrel_client_bin" "$@")"
+text="$(KEYSTREL_START_CHIME=0 KEYSTREL_MUTE_START_DELAY_MS="$ptt_mute_start_delay_ms" KEYSTREL_CANCEL_FILE="$cancel_file" "$keystrel_client_bin" "$@")"
 text="${text//$'\r'/}"
 text="${text//$'\n'/ }"
 
+if [[ -f "$cancel_file" ]]; then
+  log_debug "typing skipped due cancel request"
+  rm -f "$cancel_file" >/dev/null 2>&1 || true
+  exit 0
+fi
+
 if [[ -z "${text//[[:space:]]/}" ]]; then
+  rm -f "$cancel_file" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -219,3 +256,5 @@ xdotool type --clearmodifiers --delay "$type_delay_ms" -- "$text"
 if [[ "${KEYSTREL_PTT_SEND_ENTER:-${STT_PTT_SEND_ENTER:-0}}" == "1" ]]; then
   xdotool key --clearmodifiers Return
 fi
+
+rm -f "$cancel_file" >/dev/null 2>&1 || true
