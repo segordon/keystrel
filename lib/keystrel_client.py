@@ -4,8 +4,11 @@ import argparse
 import base64
 import fcntl
 import json
+import os
 import queue
+import random
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -35,6 +38,14 @@ except Exception:  # noqa: BLE001
 
 WEBRTCVAD_SAMPLE_RATES = {8000, 16000, 32000, 48000}
 WEBRTCVAD_FRAME_MS = {10, 20, 30}
+
+PACTL_CALL_TIMEOUT_S = 1.0
+PACTL_RETRY_COUNT = 2
+PACTL_RETRY_BASE_DELAY_S = 0.03
+PACTL_RETRY_JITTER_S = 0.02
+MUTE_TRANSACTION_VERSION = 1
+
+_PACTL_TIMEOUT_OVERRIDE_S = None
 
 
 class CaptureCancelled(Exception):
@@ -200,6 +211,11 @@ def _add_output_args(parser):
         "--list-devices",
         action="store_true",
         help="list audio devices and exit",
+    )
+    parser.add_argument(
+        "--recover-output-mute",
+        action="store_true",
+        help="attempt stale mute-state recovery and exit",
     )
 
 
@@ -443,16 +459,66 @@ def build_transcription_options(args):
     return payload
 
 
-def list_output_sinks():
-    result = subprocess.run(
-        ["pactl", "list", "short", "sinks"],
-        check=False,
-        capture_output=True,
-        text=True,
+def _default_pactl_timeout_s():
+    global _PACTL_TIMEOUT_OVERRIDE_S
+    if _PACTL_TIMEOUT_OVERRIDE_S is not None:
+        return _PACTL_TIMEOUT_OVERRIDE_S
+
+    configured = parse_env_float("KEYSTREL_PACTL_TIMEOUT_S", PACTL_CALL_TIMEOUT_S)
+    _PACTL_TIMEOUT_OVERRIDE_S = max(0.05, configured)
+    return _PACTL_TIMEOUT_OVERRIDE_S
+
+
+def _run_pactl(command_args, timeout_s=None, retries=None):
+    timeout_value = _default_pactl_timeout_s() if timeout_s is None else max(0.01, float(timeout_s))
+    retry_count = PACTL_RETRY_COUNT if retries is None else max(0, int(retries))
+    command_text = " ".join(str(part) for part in command_args)
+    last_error = RuntimeError(f"pactl {command_text} failed")
+
+    for attempt in range(retry_count + 1):
+        try:
+            result = subprocess.run(
+                ["pactl", *command_args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_value,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = RuntimeError(
+                f"pactl {command_text} timed out after {timeout_value:.2f}s"
+            )
+        except OSError as exc:
+            last_error = RuntimeError(f"pactl {command_text} failed: {exc}")
+        else:
+            if result.returncode == 0:
+                return result
+
+            stderr = result.stderr.strip()
+            stdout = result.stdout.strip()
+            message = (
+                stderr
+                or stdout
+                or f"pactl {command_text} failed with exit code {result.returncode}"
+            )
+            last_error = RuntimeError(message)
+
+        if attempt >= retry_count:
+            break
+
+        backoff_s = PACTL_RETRY_BASE_DELAY_S * (2**attempt)
+        jitter_s = random.uniform(0.0, PACTL_RETRY_JITTER_S)
+        time.sleep(backoff_s + jitter_s)
+
+    raise last_error
+
+
+def list_output_sink_details(timeout_s=None, retries=None):
+    result = _run_pactl(
+        ["list", "short", "sinks"],
+        timeout_s=timeout_s,
+        retries=retries,
     )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(stderr or "pactl list short sinks failed")
 
     sinks = []
     for line in result.stdout.splitlines():
@@ -464,20 +530,162 @@ def list_output_sinks():
             parts = line.split()
         if not parts:
             continue
-        sinks.append(parts[0])
+
+        sink_id = parts[0].strip()
+        if not sink_id:
+            continue
+        sink_name = parts[1].strip() if len(parts) > 1 else ""
+        sinks.append({"sink": sink_id, "name": sink_name})
     return sinks
 
 
-def get_sink_mute_state(sink):
-    result = subprocess.run(
-        ["pactl", "get-sink-mute", sink],
-        check=False,
-        capture_output=True,
-        text=True,
+def list_output_sinks(timeout_s=None, retries=None):
+    return [
+        sink_info["sink"]
+        for sink_info in list_output_sink_details(timeout_s=timeout_s, retries=retries)
+    ]
+
+
+def _coerce_sink_state_records(sink_states):
+    records = {}
+    if not isinstance(sink_states, dict):
+        return records
+
+    for raw_sink, raw_state in sink_states.items():
+        sink = str(raw_sink).strip()
+        if not sink:
+            continue
+
+        if isinstance(raw_state, dict):
+            was_muted = bool(raw_state.get("was_muted", False))
+            changed = bool(raw_state.get("changed", not was_muted))
+            name = str(raw_state.get("name", "") or "").strip()
+        else:
+            was_muted = bool(raw_state)
+            changed = not was_muted
+            name = ""
+
+        records[sink] = {
+            "sink": sink,
+            "name": name,
+            "was_muted": was_muted,
+            "changed": changed,
+        }
+
+    return records
+
+
+def _changed_sink_states(sink_states):
+    records = _coerce_sink_state_records(sink_states)
+    return {sink: record for sink, record in records.items() if record["changed"]}
+
+
+def _mute_transaction_path(args=None):
+    explicit_path = ""
+    if args is not None:
+        explicit_path = str(getattr(args, "mute_transaction_file", "") or "").strip()
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+
+    default_path = "~/.cache/keystrel/keystrel-mute-transaction.json"
+    configured_path = get_env("KEYSTREL_MUTE_TRANSACTION_FILE", default_path)
+    return Path(configured_path or default_path).expanduser()
+
+
+def _clear_mute_transaction(args):
+    path = _mute_transaction_path(args)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _write_mute_transaction(args, sink_states, reason):
+    changed_states = _changed_sink_states(sink_states)
+    if not changed_states:
+        _clear_mute_transaction(args)
+        return
+
+    path = _mute_transaction_path(args)
+    payload = {
+        "version": MUTE_TRANSACTION_VERSION,
+        "reason": reason,
+        "pid": os.getpid(),
+        "updated_unix_s": time.time(),
+        "sinks": list(changed_states.values()),
+    }
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(encoded, encoding="utf-8")
+        temp_path.replace(path)
+    except OSError as exc:
+        if getattr(args, "verbose", False):
+            print(
+                f"[keystrel-client] failed to persist mute transaction {path}: {exc}",
+                file=sys.stderr,
+            )
+
+
+def _load_mute_transaction(args):
+    path = _mute_transaction_path(args)
+    if not path.exists():
+        return {}
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[keystrel-client] WARNING: could not parse mute transaction file {path}: {exc}",
+            file=sys.stderr,
+        )
+        _clear_mute_transaction(args)
+        return {}
+
+    if not isinstance(payload, dict):
+        _clear_mute_transaction(args)
+        return {}
+
+    sinks = payload.get("sinks", [])
+    if not isinstance(sinks, list):
+        _clear_mute_transaction(args)
+        return {}
+
+    restored = {}
+    for item in sinks:
+        if not isinstance(item, dict):
+            continue
+        sink = str(item.get("sink", "") or "").strip()
+        if not sink:
+            continue
+        restored[sink] = {
+            "sink": sink,
+            "name": str(item.get("name", "") or "").strip(),
+            "was_muted": bool(item.get("was_muted", False)),
+            "changed": bool(item.get("changed", True)),
+        }
+
+    if not restored:
+        _clear_mute_transaction(args)
+    return restored
+
+
+def _stable_sink_identifier(record):
+    sink = str(record.get("sink", "")).strip()
+    name = str(record.get("name", "")).strip()
+    if name:
+        return f"{sink}({name})"
+    return sink
+
+
+def get_sink_mute_state(sink, timeout_s=None, retries=None):
+    result = _run_pactl(
+        ["get-sink-mute", sink],
+        timeout_s=timeout_s,
+        retries=retries,
     )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(stderr or f"failed to read mute state for sink {sink}")
 
     output = result.stdout.strip().lower()
     if output.endswith("yes"):
@@ -487,16 +695,12 @@ def get_sink_mute_state(sink):
     raise RuntimeError(f"unexpected pactl output for sink {sink}: {result.stdout.strip()}")
 
 
-def set_sink_mute_state(sink, muted):
-    result = subprocess.run(
-        ["pactl", "set-sink-mute", sink, "1" if muted else "0"],
-        check=False,
-        capture_output=True,
-        text=True,
+def set_sink_mute_state(sink, muted, timeout_s=None, retries=None):
+    _run_pactl(
+        ["set-sink-mute", sink, "1" if muted else "0"],
+        timeout_s=timeout_s,
+        retries=retries,
     )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(stderr or f"failed to set mute={muted} for sink {sink}")
 
 
 def mute_output_during_capture(args):
@@ -514,10 +718,26 @@ def mute_output_during_capture(args):
     sink_states = {}
     try:
         sinks = list_output_sinks()
+        sink_names = {}
+        try:
+            sink_names = {
+                sink_info["sink"]: sink_info.get("name", "")
+                for sink_info in list_output_sink_details(timeout_s=_default_pactl_timeout_s(), retries=0)
+            }
+        except Exception:  # noqa: BLE001
+            sink_names = {}
+
         for sink in sinks:
+            sink_name = sink_names.get(sink, "")
             was_muted = get_sink_mute_state(sink)
-            sink_states[sink] = was_muted
-            if not was_muted:
+            changed = not was_muted
+            sink_states[sink] = {
+                "sink": sink,
+                "name": sink_name,
+                "was_muted": was_muted,
+                "changed": changed,
+            }
+            if changed:
                 set_sink_mute_state(sink, True)
     except Exception as exc:  # noqa: BLE001
         if args.verbose:
@@ -525,27 +745,127 @@ def mute_output_during_capture(args):
         return sink_states
 
     if args.verbose and sink_states:
-        print(f"[keystrel-client] muted {len(sink_states)} output sink(s)", file=sys.stderr)
+        changed_count = len(_changed_sink_states(sink_states))
+        print(
+            f"[keystrel-client] muted {changed_count} output sink(s) "
+            f"(observed {len(sink_states)} total)",
+            file=sys.stderr,
+        )
     return sink_states
 
 
+def _resolve_restore_candidates(record, live_sink_by_name, live_name_by_sink):
+    original_sink = record["sink"]
+    record_name = record.get("name", "")
+    remapped_sink = live_sink_by_name.get(record_name)
+    original_live_name = live_name_by_sink.get(original_sink, "")
+
+    candidates = []
+    if record.get("changed") and record_name:
+        if remapped_sink:
+            candidates.append(remapped_sink)
+        if not original_live_name or original_live_name == record_name:
+            candidates.append(original_sink)
+    else:
+        candidates.append(original_sink)
+
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        text = str(candidate).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
 def restore_output_mute(args, sink_states):
-    if not sink_states:
-        return
+    records = _coerce_sink_state_records(sink_states)
+    if not records:
+        return {}
 
-    errors = 0
-    for sink, was_muted in sink_states.items():
-        try:
-            set_sink_mute_state(sink, was_muted)
-        except Exception:  # noqa: BLE001
-            errors += 1
+    live_sink_by_name = {}
+    live_name_by_sink = {}
+    try:
+        for sink_info in list_output_sink_details(timeout_s=_default_pactl_timeout_s(), retries=0):
+            sink = str(sink_info.get("sink", "") or "").strip()
+            name = str(sink_info.get("name", "") or "").strip()
+            if not sink:
+                continue
+            live_name_by_sink[sink] = name
+            if name:
+                live_sink_by_name[name] = sink
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[keystrel-client] restore sink remap unavailable: {exc}", file=sys.stderr)
 
-    if args.verbose:
-        restored = len(sink_states) - errors
+    unresolved = {}
+    ordered_records = sorted(
+        records.values(),
+        key=lambda record: (0 if record["changed"] else 1, record["sink"]),
+    )
+    for record in ordered_records:
+        attempts = []
+        restored = False
+        for candidate in _resolve_restore_candidates(record, live_sink_by_name, live_name_by_sink):
+            try:
+                set_sink_mute_state(candidate, record["was_muted"])
+                if candidate != record["sink"] and args.verbose:
+                    print(
+                        "[keystrel-client] restore remapped sink "
+                        f"{record['sink']} -> {candidate} ({record['name']})",
+                        file=sys.stderr,
+                    )
+                restored = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"{candidate}: {exc}")
+
+        if not restored:
+            unresolved[record["sink"]] = {
+                "sink": record["sink"],
+                "name": record["name"],
+                "was_muted": record["was_muted"],
+                "changed": record["changed"],
+                "attempts": attempts,
+            }
+
+    if unresolved:
+        failed_sinks = ", ".join(
+            _stable_sink_identifier(record)
+            for _, record in sorted(unresolved.items(), key=lambda item: item[0])
+        )
         print(
-            f"[keystrel-client] restored mute state for {restored}/{len(sink_states)} sink(s)",
+            "[keystrel-client] WARNING: failed to restore mute state for "
+            f"{len(unresolved)}/{len(records)} sink(s): {failed_sinks}; "
+            "run `keystrel-unmute` for manual recovery",
             file=sys.stderr,
         )
+        if args.verbose:
+            for sink, record in sorted(unresolved.items()):
+                attempt_text = "; ".join(record.get("attempts", [])) or "no attempts"
+                print(
+                    f"[keystrel-client] restore detail sink={sink}: {attempt_text}",
+                    file=sys.stderr,
+                )
+
+    if args.verbose:
+        restored = len(records) - len(unresolved)
+        print(
+            f"[keystrel-client] restored mute state for {restored}/{len(records)} sink(s)",
+            file=sys.stderr,
+        )
+
+    return {
+        sink: {
+            "sink": record["sink"],
+            "name": record["name"],
+            "was_muted": record["was_muted"],
+            "changed": record["changed"],
+        }
+        for sink, record in unresolved.items()
+    }
 
 
 def cancel_requested(args):
@@ -562,7 +882,11 @@ def confirm_output_mute_before_capture(args, sink_states):
     if args.mute_settle_ms <= 0 or not sink_states:
         return
 
-    pending = {sink for sink, was_muted in sink_states.items() if not was_muted}
+    pending = {
+        sink
+        for sink, record in _coerce_sink_state_records(sink_states).items()
+        if record["changed"]
+    }
     if not pending:
         return
 
@@ -581,9 +905,15 @@ def confirm_output_mute_before_capture(args, sink_states):
             raise CaptureCancelled()
 
         still_pending = set()
-        for sink in pending:
+        pending_order = sorted(pending)
+        for index, sink in enumerate(pending_order):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                still_pending.update(pending_order[index:])
+                break
+            per_call_timeout_s = max(0.01, min(_default_pactl_timeout_s(), remaining))
             try:
-                if not get_sink_mute_state(sink):
+                if not get_sink_mute_state(sink, timeout_s=per_call_timeout_s, retries=0):
                     still_pending.add(sink)
             except Exception:  # noqa: BLE001
                 still_pending.add(sink)
@@ -604,6 +934,97 @@ def confirm_output_mute_before_capture(args, sink_states):
             f"starting mic with unconfirmed sink(s): {pending_sinks}",
             file=sys.stderr,
         )
+
+
+def _warmup_output_control(args):
+    if not getattr(args, "mute_output", False):
+        return
+    if not shutil.which("pactl"):
+        return
+
+    try:
+        _run_pactl(["info"], timeout_s=_default_pactl_timeout_s(), retries=0)
+    except Exception as exc:  # noqa: BLE001
+        if args.verbose:
+            print(f"[keystrel-client] output control warm-up failed: {exc}", file=sys.stderr)
+
+
+def _finalize_output_mute_cleanup(args, sink_states, state, reason):
+    if state.get("done") or state.get("in_progress"):
+        return
+
+    records = _coerce_sink_state_records(sink_states)
+    if not records:
+        state["done"] = True
+        return
+
+    state["in_progress"] = True
+    try:
+        unresolved = restore_output_mute(args, records)
+        if unresolved:
+            _write_mute_transaction(args, unresolved, f"{reason}-restore-failed")
+        else:
+            _clear_mute_transaction(args)
+        state["done"] = True
+    finally:
+        state["in_progress"] = False
+
+
+def _install_output_restore_signal_handlers(args, sink_states, cleanup_state):
+    previous_handlers = {}
+
+    def handle_termination(signum, _frame):
+        signal_name = getattr(signal.Signals(signum), "name", str(signum))
+        if args.verbose:
+            print(
+                f"[keystrel-client] received {signal_name}; restoring output mute state",
+                file=sys.stderr,
+            )
+        _finalize_output_mute_cleanup(args, sink_states, cleanup_state, f"signal-{signal_name}")
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, handle_termination)
+        except Exception:  # noqa: BLE001
+            continue
+
+    return previous_handlers
+
+
+def _restore_previous_signal_handlers(previous_handlers):
+    for signum, previous_handler in previous_handlers.items():
+        try:
+            signal.signal(signum, previous_handler)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def recover_stale_output_mute(args, force=False):
+    sink_states = _load_mute_transaction(args)
+    if not sink_states:
+        return True
+
+    if not shutil.which("pactl"):
+        print(
+            "[keystrel-client] WARNING: stale mute-state recovery skipped because pactl is unavailable",
+            file=sys.stderr,
+        )
+        return False
+
+    if args.verbose or force:
+        print("[keystrel-client] recovering stale output mute state", file=sys.stderr)
+
+    unresolved = restore_output_mute(args, sink_states)
+    if unresolved:
+        _write_mute_transaction(args, unresolved, "startup-recovery-failed")
+        return False
+
+    _clear_mute_transaction(args)
+    if args.verbose or force:
+        print("[keystrel-client] stale output mute recovery completed", file=sys.stderr)
+    return True
 
 
 def acquire_client_lock(args):
@@ -1260,26 +1681,39 @@ def _resolve_transcription_target(args):
 def _capture_audio_with_output_control(args):
     sink_states = {}
     mute_applied = False
+    cleanup_state = {"done": False, "in_progress": False}
+    previous_signal_handlers = _install_output_restore_signal_handlers(
+        args,
+        sink_states,
+        cleanup_state,
+    )
 
     mute_start_delay_s = args.mute_start_delay_ms / 1000.0
 
+    def apply_output_mute(reason):
+        applied_states = mute_output_during_capture(args)
+        sink_states.clear()
+        sink_states.update(applied_states)
+        _write_mute_transaction(args, sink_states, reason)
+
     def maybe_apply_mute(elapsed_s):
-        nonlocal sink_states, mute_applied
+        nonlocal mute_applied
         if cancel_requested(args):
             raise CaptureCancelled()
         if mute_applied or not args.mute_output:
             return
         if elapsed_s < mute_start_delay_s:
             return
-        sink_states = mute_output_during_capture(args)
+        apply_output_mute("capture-delayed-mute")
         mute_applied = True
 
     try:
+        _warmup_output_control(args)
         play_start_chime(args)
         if cancel_requested(args):
             raise CaptureCancelled()
         if args.mute_output and mute_start_delay_s <= 0:
-            sink_states = mute_output_during_capture(args)
+            apply_output_mute("capture-pre-roll-mute")
             mute_applied = True
             confirm_output_mute_before_capture(args, sink_states)
         return record_until_silence(args, on_tick=maybe_apply_mute)
@@ -1291,7 +1725,8 @@ def _capture_audio_with_output_control(args):
         print(f"[keystrel-client] microphone capture failed: {exc}", file=sys.stderr)
         sys.exit(3)
     finally:
-        restore_output_mute(args, sink_states)
+        _restore_previous_signal_handlers(previous_signal_handlers)
+        _finalize_output_mute_cleanup(args, sink_states, cleanup_state, "capture-finally")
 
 
 def _should_skip_request(args, audio):
@@ -1353,6 +1788,7 @@ def _print_response(args, response):
 
 def main():
     args = parse_args()
+    recover_only = bool(getattr(args, "recover_output_mute", False))
 
     if args.list_devices:
         print(sd.query_devices())
@@ -1360,9 +1796,17 @@ def main():
 
     lock_file = acquire_client_lock(args)
     if lock_file is None:
+        if recover_only:
+            sys.exit(6)
         return
 
     try:
+        recovered = recover_stale_output_mute(args, force=recover_only)
+        if recover_only:
+            if not recovered:
+                sys.exit(6)
+            return
+
         remote_endpoint, socket_path = _resolve_transcription_target(args)
         audio = _capture_audio_with_output_control(args)
         if _should_skip_request(args, audio):

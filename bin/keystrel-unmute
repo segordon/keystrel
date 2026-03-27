@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+
+keystrel_client_bin="${KEYSTREL_CLIENT_BIN:-${STT_CLIENT_BIN:-$repo_root/bin/keystrel-client}}"
+
+if [[ ! -x "$keystrel_client_bin" ]]; then
+  printf '[keystrel-unmute] missing executable keystrel-client at %s\n' "$keystrel_client_bin" >&2
+  exit 3
+fi
+
+exec "$keystrel_client_bin" --recover-output-mute "$@"
