@@ -1,6 +1,8 @@
 import os
+import signal
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +25,8 @@ def _args(**overrides):
         "device": None,
         "channels": 1,
         "sample_rate": 16000,
+        "recover_output_mute": False,
+        "mute_transaction_file": "/tmp/keystrel-test-mute-transaction-audio.json",
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -117,6 +121,36 @@ class ClientParseAndPactlTests(unittest.TestCase):
         with mock.patch.object(keystrel_client.subprocess, "run", return_value=err_result):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 keystrel_client.get_sink_mute_state("1")
+
+    def test_run_pactl_retries_timeout_then_succeeds(self):
+        timeout_exc = keystrel_client.subprocess.TimeoutExpired(cmd=["pactl", "info"], timeout=0.1)
+        ok_result = SimpleNamespace(returncode=0, stdout="Server Name: PulseAudio\n", stderr="")
+
+        with (
+            mock.patch.object(
+                keystrel_client.subprocess,
+                "run",
+                side_effect=[timeout_exc, ok_result],
+            ) as run,
+            mock.patch.object(keystrel_client.time, "sleep") as sleep,
+        ):
+            result = keystrel_client._run_pactl(["info"], timeout_s=0.1, retries=1)
+
+        self.assertEqual(result, ok_result)
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_run_pactl_raises_after_retry_budget_exhausted(self):
+        timeout_exc = keystrel_client.subprocess.TimeoutExpired(cmd=["pactl", "info"], timeout=0.05)
+        with (
+            mock.patch.object(keystrel_client.subprocess, "run", side_effect=timeout_exc) as run,
+            mock.patch.object(keystrel_client.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                keystrel_client._run_pactl(["info"], timeout_s=0.05, retries=2)
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 class ClientVadAndSpeechRatioTests(unittest.TestCase):
@@ -285,12 +319,25 @@ class ClientMuteControlTests(unittest.TestCase):
         with (
             mock.patch.object(keystrel_client.shutil, "which", return_value="/usr/bin/pactl"),
             mock.patch.object(keystrel_client, "list_output_sinks", return_value=["1", "2"]),
+            mock.patch.object(
+                keystrel_client,
+                "list_output_sink_details",
+                return_value=[
+                    {"sink": "1", "name": "sink.one"},
+                    {"sink": "2", "name": "sink.two"},
+                ],
+            ),
             mock.patch.object(keystrel_client, "get_sink_mute_state", side_effect=[False, True]),
             mock.patch.object(keystrel_client, "set_sink_mute_state") as set_mute,
         ):
             states = keystrel_client.mute_output_during_capture(args)
 
-        self.assertEqual(states, {"1": False, "2": True})
+        self.assertEqual(states["1"]["was_muted"], False)
+        self.assertEqual(states["1"]["name"], "sink.one")
+        self.assertEqual(states["1"]["changed"], True)
+        self.assertEqual(states["2"]["was_muted"], True)
+        self.assertEqual(states["2"]["name"], "sink.two")
+        self.assertEqual(states["2"]["changed"], False)
         set_mute.assert_called_once_with("1", True)
 
     def test_mute_output_returns_partial_state_on_error(self):
@@ -300,6 +347,14 @@ class ClientMuteControlTests(unittest.TestCase):
             mock.patch.object(keystrel_client, "list_output_sinks", return_value=["1", "2"]),
             mock.patch.object(
                 keystrel_client,
+                "list_output_sink_details",
+                return_value=[
+                    {"sink": "1", "name": "sink.one"},
+                    {"sink": "2", "name": "sink.two"},
+                ],
+            ),
+            mock.patch.object(
+                keystrel_client,
                 "get_sink_mute_state",
                 side_effect=[False, RuntimeError("boom")],
             ),
@@ -307,7 +362,10 @@ class ClientMuteControlTests(unittest.TestCase):
         ):
             states = keystrel_client.mute_output_during_capture(args)
 
-        self.assertEqual(states, {"1": False})
+        self.assertEqual(states["1"]["was_muted"], False)
+        self.assertEqual(states["1"]["name"], "sink.one")
+        self.assertEqual(states["1"]["changed"], True)
+        self.assertEqual(len(states), 1)
         set_mute.assert_called_once_with("1", True)
 
     def test_restore_output_mute_attempts_all_sinks(self):
@@ -323,6 +381,90 @@ class ClientMuteControlTests(unittest.TestCase):
         set_mute.assert_any_call("1", False)
         set_mute.assert_any_call("2", True)
 
+    def test_restore_output_mute_remaps_changed_sink_by_name(self):
+        args = _args(verbose=True)
+        sink_states = {
+            "1": {
+                "sink": "1",
+                "name": "sink.alpha",
+                "was_muted": False,
+                "changed": True,
+            }
+        }
+        with (
+            mock.patch.object(
+                keystrel_client,
+                "list_output_sink_details",
+                return_value=[{"sink": "9", "name": "sink.alpha"}],
+            ),
+            mock.patch.object(
+                keystrel_client,
+                "set_sink_mute_state",
+                return_value=None,
+            ) as set_mute,
+        ):
+            unresolved = keystrel_client.restore_output_mute(args, sink_states)
+
+        self.assertEqual(unresolved, {})
+        self.assertEqual(set_mute.call_count, 1)
+        self.assertEqual(set_mute.call_args_list[0].args, ("9", False))
+
+    def test_restore_output_mute_avoids_reused_sink_id_when_name_mismatch(self):
+        args = _args(verbose=False)
+        sink_states = {
+            "1": {
+                "sink": "1",
+                "name": "sink.alpha",
+                "was_muted": False,
+                "changed": True,
+            }
+        }
+        with (
+            mock.patch.object(
+                keystrel_client,
+                "list_output_sink_details",
+                return_value=[
+                    {"sink": "1", "name": "sink.other"},
+                    {"sink": "9", "name": "sink.alpha"},
+                ],
+            ),
+            mock.patch.object(
+                keystrel_client,
+                "set_sink_mute_state",
+                return_value=None,
+            ) as set_mute,
+        ):
+            unresolved = keystrel_client.restore_output_mute(args, sink_states)
+
+        self.assertEqual(unresolved, {})
+        self.assertEqual(set_mute.call_count, 1)
+        self.assertEqual(set_mute.call_args_list[0].args, ("9", False))
+
+    def test_restore_output_mute_returns_unresolved_state_records(self):
+        args = _args(verbose=False)
+        sink_states = {
+            "3": {
+                "sink": "3",
+                "name": "sink.beta",
+                "was_muted": False,
+                "changed": True,
+            }
+        }
+        with (
+            mock.patch.object(keystrel_client, "list_output_sink_details", return_value=[]),
+            mock.patch.object(
+                keystrel_client,
+                "set_sink_mute_state",
+                side_effect=RuntimeError("still gone"),
+            ),
+        ):
+            unresolved = keystrel_client.restore_output_mute(args, sink_states)
+
+        self.assertIn("3", unresolved)
+        self.assertEqual(unresolved["3"]["name"], "sink.beta")
+        self.assertEqual(unresolved["3"]["was_muted"], False)
+        self.assertEqual(unresolved["3"]["changed"], True)
+
 
 class ClientMuteConfirmationTests(unittest.TestCase):
     def test_confirm_output_mute_returns_when_all_sinks_muted(self):
@@ -331,10 +473,14 @@ class ClientMuteConfirmationTests(unittest.TestCase):
             mock.patch.object(
                 keystrel_client,
                 "get_sink_mute_state",
-                side_effect=[False, True, True],
+                side_effect=[False, True],
             ) as get_mute,
             mock.patch.object(keystrel_client.time, "sleep") as sleep,
-            mock.patch.object(keystrel_client.time, "monotonic", side_effect=[0.0, 0.05, 0.10]),
+            mock.patch.object(
+                keystrel_client.time,
+                "monotonic",
+                side_effect=[0.0, 0.01, 0.02, 0.03, 0.04],
+            ),
         ):
             keystrel_client.confirm_output_mute_before_capture(args, {"1": False, "2": True})
 
@@ -346,14 +492,39 @@ class ClientMuteConfirmationTests(unittest.TestCase):
         with (
             mock.patch.object(keystrel_client, "get_sink_mute_state", return_value=False) as get_mute,
             mock.patch.object(keystrel_client.time, "sleep") as sleep,
-            mock.patch.object(keystrel_client.time, "monotonic", side_effect=[0.0, 0.01, 0.03, 0.05]),
+            mock.patch.object(
+                keystrel_client.time,
+                "monotonic",
+                side_effect=[0.0, 0.01, 0.03, 0.05, 0.05],
+            ),
         ):
             keystrel_client.confirm_output_mute_before_capture(args, {"1": False})
 
-        self.assertEqual(get_mute.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
-        self.assertAlmostEqual(sleep.call_args_list[0].args[0], 0.02)
-        self.assertAlmostEqual(sleep.call_args_list[1].args[0], 0.01)
+        self.assertEqual(get_mute.call_count, 1)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertAlmostEqual(sleep.call_args_list[0].args[0], 0.01)
+
+    def test_confirm_output_mute_stops_checking_extra_sinks_after_deadline(self):
+        args = _args(mute_settle_ms=20, verbose=False)
+        with (
+            mock.patch.object(keystrel_client, "get_sink_mute_state", return_value=False) as get_mute,
+            mock.patch.object(keystrel_client.time, "sleep") as sleep,
+            mock.patch.object(
+                keystrel_client.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 0.03, 0.03],
+            ),
+        ):
+            keystrel_client.confirm_output_mute_before_capture(
+                args,
+                {
+                    "1": {"sink": "1", "name": "sink.one", "was_muted": False, "changed": True},
+                    "2": {"sink": "2", "name": "sink.two", "was_muted": False, "changed": True},
+                },
+            )
+
+        self.assertEqual(get_mute.call_count, 1)
+        sleep.assert_not_called()
 
     def test_confirm_output_mute_can_be_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -366,6 +537,113 @@ class ClientMuteConfirmationTests(unittest.TestCase):
                     keystrel_client.confirm_output_mute_before_capture(args, {"1": False})
 
         get_mute.assert_not_called()
+
+
+class ClientMuteRecoveryTests(unittest.TestCase):
+    def test_recover_stale_output_mute_clears_transaction_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transaction_path = Path(tmp_dir) / "mute-transaction.json"
+            transaction_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "sinks": [
+                            {
+                                "sink": "1",
+                                "name": "sink.alpha",
+                                "was_muted": False,
+                                "changed": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = _args(mute_transaction_file=str(transaction_path), verbose=True)
+
+            with (
+                mock.patch.object(keystrel_client.shutil, "which", return_value="/usr/bin/pactl"),
+                mock.patch.object(keystrel_client, "restore_output_mute", return_value={}) as restore,
+            ):
+                recovered = keystrel_client.recover_stale_output_mute(args, force=True)
+
+        self.assertTrue(recovered)
+        restore.assert_called_once()
+        self.assertFalse(transaction_path.exists())
+
+    def test_recover_stale_output_mute_keeps_transaction_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transaction_path = Path(tmp_dir) / "mute-transaction.json"
+            transaction_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "sinks": [
+                            {
+                                "sink": "1",
+                                "name": "sink.alpha",
+                                "was_muted": False,
+                                "changed": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = _args(mute_transaction_file=str(transaction_path), verbose=False)
+            unresolved = {
+                "1": {
+                    "sink": "1",
+                    "name": "sink.alpha",
+                    "was_muted": False,
+                    "changed": True,
+                }
+            }
+
+            with (
+                mock.patch.object(keystrel_client.shutil, "which", return_value="/usr/bin/pactl"),
+                mock.patch.object(
+                    keystrel_client,
+                    "restore_output_mute",
+                    return_value=unresolved,
+                ) as restore,
+            ):
+                recovered = keystrel_client.recover_stale_output_mute(args, force=False)
+
+            self.assertFalse(recovered)
+            self.assertTrue(transaction_path.exists())
+            restore.assert_called_once()
+
+    def test_signal_handler_triggers_mute_cleanup(self):
+        args = _args(verbose=False)
+        sink_states = {
+            "1": {
+                "sink": "1",
+                "name": "sink.alpha",
+                "was_muted": False,
+                "changed": True,
+            }
+        }
+        cleanup_state = {"done": False, "in_progress": False}
+
+        with mock.patch.object(keystrel_client, "_finalize_output_mute_cleanup") as finalize:
+            previous = keystrel_client._install_output_restore_signal_handlers(
+                args,
+                sink_states,
+                cleanup_state,
+            )
+            try:
+                handler = signal.getsignal(signal.SIGTERM)
+                self.assertTrue(callable(handler))
+                if not callable(handler):
+                    self.fail("SIGTERM handler was not installed")
+                with self.assertRaises(SystemExit) as ctx:
+                    handler(signal.SIGTERM, None)
+            finally:
+                keystrel_client._restore_previous_signal_handlers(previous)
+
+        self.assertEqual(ctx.exception.code, 128 + signal.SIGTERM)
+        finalize.assert_called_once()
 
 
 class ClientInputDeviceSelectionTests(unittest.TestCase):

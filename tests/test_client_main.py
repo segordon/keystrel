@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from uuid import uuid4
 
 from tests._module_loader import load_client_module
 
@@ -37,6 +38,8 @@ def _base_args(**overrides):
         "channels": 1,
         "start_chime": False,
         "cancel_file": "",
+        "recover_output_mute": False,
+        "mute_transaction_file": f"/tmp/keystrel-test-mute-transaction-main-{uuid4().hex}.json",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -66,6 +69,42 @@ class ClientMainFlowTests(unittest.TestCase):
 
         self.assertIn("mic0", stdout.getvalue())
         acquire_lock.assert_not_called()
+
+    def test_recover_output_mute_mode_exits_when_lock_unavailable(self):
+        args = _base_args(recover_output_mute=True)
+        with (
+            mock.patch.object(keystrel_client, "parse_args", return_value=args),
+            mock.patch.object(keystrel_client, "acquire_client_lock", return_value=None),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                keystrel_client.main()
+
+        self.assertEqual(ctx.exception.code, 6)
+
+    def test_recover_output_mute_mode_returns_without_capture(self):
+        args = _base_args(recover_output_mute=True)
+        with (
+            mock.patch.object(keystrel_client, "parse_args", return_value=args),
+            mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+            mock.patch.object(keystrel_client, "recover_stale_output_mute", return_value=True) as recover,
+            mock.patch.object(keystrel_client, "_resolve_transcription_target") as resolve_target,
+        ):
+            keystrel_client.main()
+
+        recover.assert_called_once_with(args, force=True)
+        resolve_target.assert_not_called()
+
+    def test_recover_output_mute_mode_exits_when_recovery_fails(self):
+        args = _base_args(recover_output_mute=True)
+        with (
+            mock.patch.object(keystrel_client, "parse_args", return_value=args),
+            mock.patch.object(keystrel_client, "acquire_client_lock", return_value=io.StringIO()),
+            mock.patch.object(keystrel_client, "recover_stale_output_mute", return_value=False),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                keystrel_client.main()
+
+        self.assertEqual(ctx.exception.code, 6)
 
     def test_missing_local_socket_exits_with_code_2(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

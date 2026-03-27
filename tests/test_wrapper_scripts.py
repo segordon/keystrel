@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLIENT_WRAPPER = REPO_ROOT / "bin" / "keystrel-client"
 DAEMON_WRAPPER = REPO_ROOT / "bin" / "keystrel-daemon"
+UNMUTE_WRAPPER = REPO_ROOT / "bin" / "keystrel-unmute"
 
 
 def _write_file(path, content):
@@ -87,6 +88,57 @@ class WrapperScriptSymlinkTests(unittest.TestCase):
         payload = json.loads(result.stdout.strip())
         self.assertEqual(payload["role"], "daemon")
         self.assertEqual(payload["args"], ["--via-symlink"])
+
+    def test_unmute_wrapper_symlink_forwards_recover_flag(self):
+        fake_client = self.temp_dir / "fake-client"
+        _write_file(
+            fake_client,
+            (
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import sys\n"
+                "print(json.dumps({'args': sys.argv[1:]}))\n"
+            ),
+        )
+        fake_client.chmod(0o755)
+
+        wrapper_link = self.temp_dir / "keystrel-unmute-link"
+        wrapper_link.symlink_to(UNMUTE_WRAPPER)
+
+        env = os.environ.copy()
+        env.update({"KEYSTREL_CLIENT_BIN": str(fake_client)})
+
+        result = subprocess.run(
+            ["bash", str(wrapper_link), "--via-symlink"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=f"stdout={result.stdout} stderr={result.stderr}")
+        payload = json.loads(result.stdout.strip())
+        self.assertEqual(payload["args"], ["--recover-output-mute", "--via-symlink"])
+
+    def test_unmute_wrapper_reports_missing_client_binary(self):
+        wrapper_link = self.temp_dir / "keystrel-unmute-link"
+        wrapper_link.symlink_to(UNMUTE_WRAPPER)
+
+        env = os.environ.copy()
+        env.update({"KEYSTREL_CLIENT_BIN": str(self.temp_dir / "does-not-exist")})
+
+        result = subprocess.run(
+            ["bash", str(wrapper_link)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("missing executable keystrel-client", result.stderr)
 
 
 if __name__ == "__main__":
